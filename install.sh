@@ -37,6 +37,8 @@ CONFIG=$CONF_DIR/config.json
 NET_SCRIPT=/usr/local/sbin/tunx-net
 UNIT_POLICY=/etc/systemd/system/tunx-policy.service
 UNIT_TUN=/etc/systemd/system/tunx.service
+UNIT_GUARD=/etc/systemd/system/tunx-guard.service
+UNIT_GUARD_TIMER=/etc/systemd/system/tunx-guard.timer
 STATE_DIR=/var/lib/tunx
 NM_CONF=/etc/NetworkManager/conf.d/90-tunx.conf
 
@@ -351,6 +353,21 @@ case "\${1:-}" in
     done
     firewall_up || exit 1
     ;;
+  ensure)
+    # Put the rules and the firewall back if something removed them (for
+    # example "nft flush ruleset" from another tool).
+    missing=""
+    nft list table inet tunx >/dev/null 2>&1 || missing="firewall"
+    for f in \$fams; do
+      for p in $RULE_XRAY $RULE_INBOUND $RULE_TUN; do
+        ip \$f rule show | grep -q "^\$p:" || missing="\$missing rule\$f:\$p"
+      done
+    done
+    if [ -n "\$missing" ]; then
+      echo "missing:\$missing; restoring"
+      exec "\$0" policy-up
+    fi
+    ;;
   policy-down)
     for f in \$fams; do
       rule_del \$f $RULE_TUN
@@ -371,7 +388,7 @@ case "\${1:-}" in
         ip -6 route replace default dev "\$TUN_NAME" metric 10 table $TABLE || true
     fi
     ;;
-  *) echo "usage: \$0 policy-up|policy-down|tun-up" >&2; exit 2 ;;
+  *) echo "usage: \$0 policy-up|policy-down|ensure|tun-up" >&2; exit 2 ;;
 esac
 EOF
     chmod 755 "$NET_SCRIPT"
@@ -422,6 +439,27 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
+EOF
+    cat >"$UNIT_GUARD" <<EOF
+[Unit]
+Description=Restore Xray TUN routing and firewall if removed
+After=tunx-policy.service
+
+[Service]
+Type=oneshot
+ExecStart=$NET_SCRIPT ensure
+EOF
+    cat >"$UNIT_GUARD_TIMER" <<EOF
+[Unit]
+Description=Check Xray TUN routing and firewall every 30 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -522,7 +560,7 @@ cmd_install() {
     systemctl stop tunx.service 2>/dev/null || true
     # Not a restart: stopping the policy unit would drop the rules for a moment.
     "$NET_SCRIPT" policy-up
-    systemctl enable --now tunx-policy.service tunx.service >/dev/null 2>&1
+    systemctl enable --now tunx-policy.service tunx.service tunx-guard.timer >/dev/null 2>&1
     systemctl restart tunx.service
     setup_dns
     if [ "$starter" -eq 1 ]; then
@@ -569,7 +607,7 @@ cmd_reload() {
 }
 
 cmd_uninstall() {
-    systemctl disable --now tunx.service tunx-policy.service >/dev/null 2>&1 || true
+    systemctl disable --now tunx-guard.timer tunx.service tunx-policy.service >/dev/null 2>&1 || true
     if [ -x "$NET_SCRIPT" ]; then "$NET_SCRIPT" policy-down 2>/dev/null || true; fi
     if [ -e "$CONFIG" ]; then
         local saved
@@ -577,7 +615,7 @@ cmd_uninstall() {
         install -m 600 "$CONFIG" "$saved"
         log "Config saved to $saved"
     fi
-    rm -f "$UNIT_TUN" "$UNIT_POLICY" "$NET_SCRIPT" "$BIN"
+    rm -f "$UNIT_TUN" "$UNIT_POLICY" "$UNIT_GUARD" "$UNIT_GUARD_TIMER" "$NET_SCRIPT" "$BIN"
     rm -rf "$ASSET_DIR" "$CONF_DIR"
     systemctl daemon-reload
     restore_dns
