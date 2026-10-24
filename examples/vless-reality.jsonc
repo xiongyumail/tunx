@@ -27,7 +27,7 @@
       "tag": "tun-in",
       "port": 0,
       "protocol": "tun",
-      "settings": { "name": "tunx0", "mtu": 1500, "autoOutboundsInterface": "eth0" },
+      "settings": { "name": "tunx0", "mtu": 1500 },
       "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
     }
   ],

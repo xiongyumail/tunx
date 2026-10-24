@@ -15,15 +15,19 @@ set -euo pipefail
 
 XRAY_VERSION_DEFAULT="v26.10.21"
 TUN_NAME="tunx0"
-UPLINK=""
 TUN_ADDR="198.18.0.1/30"
 TUN_ADDR6="fdfe:dcba:9876::1/126"
 TABLE=100
-RULE_OIF=8991
-RULE_LINK=8995
+RULE_XRAY=8991
+RULE_INBOUND=8995
 RULE_TUN=9100
+# Connections opened from outside through a physical interface get this mark,
+# so their replies can leave the same way.
+MARK_INBOUND=0x2a
 
 BIN=/usr/local/bin/xray
+# Xray runs as this system user; only its sockets bypass the TUN.
+XRAY_USER=tunx
 ASSET_DIR=/usr/local/share/xray
 CONF_DIR=/etc/tunx
 CONFIG=$CONF_DIR/config.json
@@ -58,7 +62,6 @@ Install options:
   --zip PATH           Use a local Xray-linux-*.zip instead of downloading
   --proxy URL          Proxy for downloading Xray, e.g. socks5h://192.168.1.10:1080
   --tun-name NAME      TUN interface name (default: $TUN_NAME)
-  --uplink DEV         Physical interface Xray sends from (default: current default route)
 EOF
 }
 
@@ -82,18 +85,22 @@ xray_asset_name() {
 
 check_deps() {
     local missing=()
-    for c in curl unzip ip systemctl sha256sum python3; do
+    for c in curl unzip ip nft systemctl sha256sum python3; do
         command -v "$c" >/dev/null || missing+=("$c")
     done
-    [ ${#missing[@]} -eq 0 ] || die "missing commands: ${missing[*]} (apt install curl unzip iproute2 python3)"
+    [ ${#missing[@]} -eq 0 ] || die "missing commands: ${missing[*]} (apt install curl unzip iproute2 nftables python3)"
     [ -d /run/systemd/system ] || die "systemd is not running (on WSL set [boot] systemd=true in /etc/wsl.conf)"
     [ -c /dev/net/tun ] || modprobe tun 2>/dev/null || true
     [ -c /dev/net/tun ] || die "/dev/net/tun not available"
 }
 
-detect_uplink() {
-    ip -4 route show table main default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}'
+ensure_user() {
+    id -u "$XRAY_USER" >/dev/null 2>&1 ||
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$XRAY_USER"
 }
+
+# The config holds credentials: readable by root and the Xray user only.
+protect_config() { chown "root:$XRAY_USER" "$CONFIG"; chmod 640 "$CONFIG"; }
 
 install_xray() {
     local version="$1" zip="$2" via="$3" tmp
@@ -158,8 +165,7 @@ write_starter_config() {
       "protocol": "tun",
       "settings": {
         "name": "$TUN_NAME",          // must match --tun-name
-        "mtu": 1500,
-        "autoOutboundsInterface": "$UPLINK"   // binds every outbound to $UPLINK so it skips the TUN
+        "mtu": 1500
       },
       "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
     }
@@ -214,10 +220,10 @@ check_config() {
         XRAY_LOCATION_ASSET=$ASSET_DIR "$BIN" run -test -c "$file" 2>&1 | tail -5 >&2
         die "Xray rejected $file"
     fi
-    TUN_NAME="$TUN_NAME" UPLINK="$UPLINK" python3 -I -c '
+    TUN_NAME="$TUN_NAME" python3 -I -c '
 import json, os, sys
 cfg = json.load(sys.stdin)
-name, uplink = os.environ["TUN_NAME"], os.environ["UPLINK"]
+name = os.environ["TUN_NAME"]
 errors = []
 tuns = [i for i in cfg.get("inbounds") or [] if i.get("protocol") == "tun"]
 if len(tuns) != 1:
@@ -228,10 +234,6 @@ else:
         errors.append("tun inbound name is %r, expected %r" % (s.get("name"), name))
     if s.get("autoSystemRoutingTable"):
         errors.append("remove autoSystemRoutingTable: routes are managed by tunx-net")
-    # Binds every outbound to the uplink, so traffic from Xray itself skips the TUN.
-    if s.get("autoOutboundsInterface") != uplink:
-        errors.append("tun inbound autoOutboundsInterface is %r, expected %r"
-                      % (s.get("autoOutboundsInterface"), uplink))
 if not cfg.get("outbounds"):
     errors.append("no outbounds")
 # With DNS hijacking, the built-in DNS also serves the system. An upstream hostname
@@ -267,18 +269,22 @@ write_net_env() {
     install -d -m 755 "$CONF_DIR"
     {
         printf 'TUN_NAME="%s"\n' "$TUN_NAME"
-        printf 'UPLINK="%s"\n' "$UPLINK"
+        printf 'XRAY_UID="%s"\n' "$(id -u "$XRAY_USER")"
     } >"$CONF_DIR/net.env"
 }
 
 write_net_script() {
     cat >"$NET_SCRIPT" <<EOF
 #!/bin/bash
-# Policy routing for the Xray TUN (managed by tunx).
-# Xray's own sockets (bound to the uplink) and on-link subnets use the main
-# table; everything else, LAN included, goes to table $TABLE and Xray does the
-# routing. IPv4 and IPv6 both go to the TUN; the table's fallback is
+# Policy routing and firewall for the Xray TUN (managed by tunx).
+# Sockets of the Xray user, and replies to connections opened from outside, use
+# the main table; everything else, LAN included, goes to table $TABLE and Xray
+# does the routing. IPv4 and IPv6 both go to the TUN; the table's fallback is
 # unreachable, so traffic fails closed while Xray is down.
+# Routing alone cannot stop a program that binds its socket to a physical
+# interface: when the lookup fails, the kernel sends it out as if on-link. The
+# nftables table drops such packets unless they belong to the Xray user, reply to
+# an inbound connection, or are link-level (broadcast, multicast, DHCP).
 set -u
 . $CONF_DIR/net.env
 
@@ -286,26 +292,54 @@ rule_del() { while ip "\$1" rule show | grep -q "^\$2:"; do ip "\$1" rule del pr
 # rule_set FAMILY PRIORITY SELECTOR...: replace the rule at PRIORITY.
 rule_set() { rule_del "\$1" "\$2"; ip "\$1" rule add "\${@:3}" priority "\$2"; }
 
+firewall_up() {
+  nft -f - <<NFT
+table inet tunx
+delete table inet tunx
+table inet tunx {
+  chain pre {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname != { "lo", "\$TUN_NAME" } ct state new ct mark set $MARK_INBOUND
+  }
+  chain route {
+    type route hook output priority mangle; policy accept;
+    ct mark $MARK_INBOUND meta mark set $MARK_INBOUND
+  }
+  chain out {
+    type filter hook output priority filter; policy accept;
+    oifname { "lo", "\$TUN_NAME" } accept
+    meta skuid \$XRAY_UID accept
+    meta mark $MARK_INBOUND accept
+    ip daddr { 255.255.255.255, 224.0.0.0/4 } accept
+    ip6 daddr { ff00::/8, fe80::/10 } accept
+    udp sport 68 udp dport 67 accept
+    udp sport 546 udp dport 547 accept
+    counter drop
+  }
+}
+NFT
+}
+
 case "\${1:-}" in
   policy-up)
-    # Safe to rerun: the catch-all rule and the unreachable fallback stay in
-    # place, so refreshing the bypass rules can only block, never leak.
+    # Safe to rerun: the firewall, the catch-all rule and the unreachable
+    # fallback stay in place, so refreshing the bypass rules can only block.
+    firewall_up || exit 1
     for f in -4 -6; do
       ip \$f route replace unreachable default metric 4096 table $TABLE
       ip \$f rule show | grep -q "^$RULE_TUN:" || ip \$f rule add lookup $TABLE priority $RULE_TUN
-      rule_set \$f $RULE_OIF oif "\$UPLINK" lookup main
-      # On-link routes only (e.g. the WSL NAT subnet), so replies to inbound
-      # connections from the host do not end up in the TUN.
-      rule_set \$f $RULE_LINK lookup main suppress_prefixlength 0
+      rule_set \$f $RULE_XRAY uidrange "\$XRAY_UID-\$XRAY_UID" lookup main
+      rule_set \$f $RULE_INBOUND fwmark $MARK_INBOUND lookup main
     done
     ;;
   policy-down)
     for f in -4 -6; do
       rule_del \$f $RULE_TUN
-      rule_del \$f $RULE_LINK
-      rule_del \$f $RULE_OIF
+      rule_del \$f $RULE_INBOUND
+      rule_del \$f $RULE_XRAY
       ip \$f route flush table $TABLE 2>/dev/null || true
     done
+    nft delete table inet tunx 2>/dev/null || true
     ;;
   tun-up)
     for _ in \$(seq 50); do ip link show "\$TUN_NAME" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -329,7 +363,8 @@ Description=Policy routing for Xray TUN (fail closed)
 # Install the rules before anything uses the network, so nothing leaves
 # directly during boot while Xray is still starting.
 DefaultDependencies=no
-After=local-fs.target
+# After nftables.service: its default config flushes the whole ruleset.
+After=local-fs.target nftables.service
 Before=network-pre.target shutdown.target
 Wants=network-pre.target
 Conflicts=shutdown.target
@@ -350,9 +385,15 @@ Requires=tunx-policy.service
 After=tunx-policy.service
 
 [Service]
+User=$XRAY_USER
+Group=$XRAY_USER
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
 Environment=XRAY_LOCATION_ASSET=$ASSET_DIR
 ExecStart=$BIN run -c $CONFIG
-ExecStartPost=$NET_SCRIPT tun-up
+# "+": addresses and routes are set with full privileges.
+ExecStartPost=+$NET_SCRIPT tun-up
 Restart=always
 RestartSec=2
 LimitNOFILE=65535
@@ -424,15 +465,13 @@ cmd_install() {
             --zip) zip="$2"; shift 2 ;;
             --proxy) via="$2"; shift 2 ;;
             --tun-name) TUN_NAME="$2"; shift 2 ;;
-            --uplink) UPLINK="$2"; shift 2 ;;
             -h | --help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
     done
     [[ "$TUN_NAME" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "bad --tun-name: $TUN_NAME (1-15 chars: letters, digits, _ . -)"
-    [ -n "$UPLINK" ] || UPLINK=$(detect_uplink)
-    { [ -n "$UPLINK" ] && ip link show "$UPLINK" >/dev/null 2>&1; } || die "cannot find the uplink interface (use --uplink)"
     check_deps
+    ensure_user
 
     install_xray "$version" "$zip" "$via"
     local starter=0
@@ -452,6 +491,7 @@ cmd_install() {
         write_starter_config
         starter=1
     fi
+    protect_config
     write_net_env
     write_net_script
     write_units
@@ -526,6 +566,7 @@ cmd_uninstall() {
         if [ -e /etc/timezone ]; then echo "$tz" >/etc/timezone; fi
     fi
     rm -rf "$STATE_DIR"
+    userdel "$XRAY_USER" 2>/dev/null || true
     log "Removed. Traffic now uses the normal route."
 }
 
@@ -533,11 +574,10 @@ cmd_status() {
     load_env
     systemctl --no-pager --lines=5 status tunx.service 2>/dev/null | sed -n '1,5p' || true
     echo
-    echo "Rules:"; ip rule show | grep -E "^($RULE_OIF|$RULE_LINK|$RULE_TUN):" || echo "  (none)"
+    echo "Rules:"; ip rule show | grep -E "^($RULE_XRAY|$RULE_INBOUND|$RULE_TUN):" || echo "  (none)"
     echo "Table $TABLE:"; ip route show table $TABLE 2>/dev/null || true
     echo "IPv6 table $TABLE:"; ip -6 route show table $TABLE 2>/dev/null || true
     echo "Interface:"; ip -br addr show "$TUN_NAME" 2>/dev/null || echo "  $TUN_NAME missing"
-    echo "Uplink: ${UPLINK:-?}"
     echo "DNS:"; grep '^nameserver' /etc/resolv.conf || true
 }
 
@@ -576,6 +616,25 @@ EOF
     local v6
     v6=$("${noenv[@]}" curl -s -6 --max-time 8 'https://[2606:4700:4700::1111]/cdn-cgi/trace' | awk -F= '/^ip=/{print $2}' || true)
     echo "IPv6       : ${v6:-none}"
+    # Other programs must not get around the TUN by binding to the physical
+    # interface: the firewall drops the packet and sendto fails with EPERM.
+    local dev bind
+    dev=$(ip -4 route show table main default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+    if [ -n "$dev" ]; then
+        bind=$(python3 -I - "$dev" <<'EOF' 2>/dev/null || true
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, sys.argv[1].encode())
+    s.sendto(b"x", ("192.0.2.1", 9))
+except PermissionError:
+    print("blocked")
+else:
+    print("LEAK")
+EOF
+)
+        echo "Bind $dev  : ${bind:-FAIL}"; [ "$bind" = "blocked" ] || fail=1
+    fi
     local x
     for x in "${dns:-}" "${udp:-}"; do
         if [ -n "$tcp" ] && [ -n "$x" ] && [ "$x" != "$tcp" ]; then
