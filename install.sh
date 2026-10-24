@@ -5,6 +5,7 @@
 #   sudo ./install.sh install [--config my-config.json]
 #   sudo ./install.sh reload
 #   sudo ./install.sh status | test | check
+#   sudo ./install.sh tz
 #   sudo ./install.sh uninstall
 #
 # This script owns the plumbing: Xray binary, TUN policy routing (fail closed),
@@ -47,6 +48,7 @@ Commands:
   uninstall   Stop, remove everything, restore DNS
   status      Show service, routing, and DNS state
   test        Check egress IP over TCP, DNS, UDP (STUN), and IPv6
+  tz          Set the system time zone to that of the egress IP (restored on uninstall)
 
 Install options:
   --config FILE        Xray config to install (checked first; the old one is kept as
@@ -360,22 +362,27 @@ WantedBy=multi-user.target
 EOF
 }
 
+# wsl_conf_set SECTION KEY VALUE: set a key in /etc/wsl.conf; the original file
+# is kept once and restored on uninstall.
+wsl_conf_set() {
+    install -d "$STATE_DIR"
+    touch /etc/wsl.conf
+    [ -e "$STATE_DIR/wsl.conf.orig" ] || cp /etc/wsl.conf "$STATE_DIR/wsl.conf.orig"
+    if grep -q "^$2" /etc/wsl.conf; then
+        sed -i "s/^$2.*/$2=$3/" /etc/wsl.conf
+    elif grep -q "^\[$1\]" /etc/wsl.conf; then
+        sed -i "/^\[$1\]/a $2=$3" /etc/wsl.conf
+    else
+        printf '\n[%s]\n%s=%s\n' "$1" "$2" "$3" >>/etc/wsl.conf
+    fi
+}
+
 setup_dns() {
     install -d "$STATE_DIR"
     if [ ! -e "$STATE_DIR/resolv.conf.orig" ] && [ ! -L "$STATE_DIR/resolv.conf.orig" ]; then
         cp -P /etc/resolv.conf "$STATE_DIR/resolv.conf.orig" 2>/dev/null || true
     fi
-    if is_wsl; then
-        touch /etc/wsl.conf
-        [ -e "$STATE_DIR/wsl.conf.orig" ] || cp /etc/wsl.conf "$STATE_DIR/wsl.conf.orig"
-        if grep -q '^generateResolvConf' /etc/wsl.conf; then
-            sed -i 's/^generateResolvConf.*/generateResolvConf=false/' /etc/wsl.conf
-        elif grep -q '^\[network\]' /etc/wsl.conf; then
-            sed -i '/^\[network\]/a generateResolvConf=false' /etc/wsl.conf
-        else
-            printf '\n[network]\ngenerateResolvConf=false\n' >>/etc/wsl.conf
-        fi
-    fi
+    if is_wsl; then wsl_conf_set network generateResolvConf false; fi
     rm -f /etc/resolv.conf
     {
         echo "# Managed by tunx: queries go through $TUN_NAME"
@@ -468,6 +475,20 @@ cmd_install() {
     fi
 }
 
+cmd_tz() {
+    local tz cur
+    [ -d "$STATE_DIR" ] || die "tunx is not installed (run install first)"
+    tz=$(curl -s --max-time 10 https://ipinfo.io/json | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("timezone", ""))' 2>/dev/null || true)
+    [ -n "$tz" ] || tz=$(curl -s --max-time 10 https://ipapi.co/timezone/ || true)
+    { [[ "$tz" =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -e "/usr/share/zoneinfo/$tz" ]; } || die "cannot get the egress time zone (got: ${tz:-nothing})"
+    cur=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    [ -e "$STATE_DIR/timezone.orig" ] || echo "${cur:-UTC}" >"$STATE_DIR/timezone.orig"
+    # Otherwise WSL resets the time zone to the Windows one at every start.
+    if is_wsl; then wsl_conf_set time useWindowsTimezone false; fi
+    timedatectl set-timezone "$tz"
+    log "Time zone set to $tz (was ${cur:-unknown})"
+}
+
 cmd_check() {
     load_env
     [ -x "$BIN" ] || die "Xray is not installed (run install first)"
@@ -496,6 +517,9 @@ cmd_uninstall() {
     rm -rf "$ASSET_DIR" "$CONF_DIR"
     systemctl daemon-reload
     restore_dns
+    if [ -e "$STATE_DIR/timezone.orig" ]; then
+        timedatectl set-timezone "$(cat "$STATE_DIR/timezone.orig")" && log "Restored time zone $(cat "$STATE_DIR/timezone.orig")"
+    fi
     rm -rf "$STATE_DIR"
     log "Removed. Traffic now uses the normal route."
 }
@@ -565,6 +589,7 @@ main() {
         uninstall) need_root; cmd_uninstall ;;
         status) cmd_status ;;
         test) cmd_test ;;
+        tz) need_root; cmd_tz ;;
         -h | --help | help | "") usage ;;
         *) usage; exit 2 ;;
     esac
