@@ -37,7 +37,8 @@
       "settings": { "servers": [ { "address": "192.168.1.10", "port": 1081 } ] } },
     { "tag": "direct", "protocol": "freedom" },
     { "tag": "dns-out", "protocol": "dns",
-      "settings": { "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
+      "settings": { "rewriteAddress": "1.1.1.1", "rewritePort": 53,
+                    "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
       "streamSettings": { "sockopt": { "dialerProxy": "proxy" } } },
     { "tag": "block", "protocol": "blackhole" }
   ],

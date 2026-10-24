@@ -38,7 +38,6 @@ NET_SCRIPT=/usr/local/sbin/tunx-net
 UNIT_POLICY=/etc/systemd/system/tunx-policy.service
 UNIT_TUN=/etc/systemd/system/tunx.service
 UNIT_GUARD=/etc/systemd/system/tunx-guard.service
-UNIT_GUARD_TIMER=/etc/systemd/system/tunx-guard.timer
 STATE_DIR=/var/lib/tunx
 NM_CONF=/etc/NetworkManager/conf.d/90-tunx.conf
 
@@ -186,9 +185,10 @@ write_starter_config() {
       "streamSettings": { "sockopt": { "domainStrategy": "UseIPv4" } }
     },
     { "tag": "direct", "protocol": "freedom" },
-    // A/AAAA go to the built-in DNS above; other types are forwarded through the proxy.
+    // A/AAAA go to the built-in DNS above; other types go to 1.1.1.1 through the proxy.
     { "tag": "dns-out", "protocol": "dns",
-      "settings": { "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
+      "settings": { "rewriteAddress": "1.1.1.1", "rewritePort": 53,
+                    "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
       "streamSettings": { "sockopt": { "dialerProxy": "proxy" } } },
     { "tag": "block", "protocol": "blackhole" }
   ],
@@ -333,7 +333,28 @@ set -u
 # IPv6 rules only when the kernel has IPv6.
 fams="-4"; [ -e /proc/net/if_inet6 ] && fams="-4 -6"
 
+mkdir -p /run/tunx
+# One change at a time: install, boot and the guard may run this together.
+case "\${1:-}" in policy-up|policy-down|ensure) exec 9>/run/tunx/lock; flock 9 ;; esac
+
 rule_del() { while ip "\$1" rule show | grep -q "^\$2:"; do ip "\$1" rule del priority "\$2"; done; }
+# rule_is FAMILY PRIORITY TEXT: exactly one rule at PRIORITY, reading TEXT.
+rule_is() { [ "\$(ip "\$1" rule show priority "\$2" | sed 's/^[0-9]*:[[:space:]]*//; s/[[:space:]]*\$//')" = "\$3" ]; }
+# Fingerprint of the firewall table without its counters.
+fw_sig() { nft list table inet tunx 2>/dev/null | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/' | sha256sum | cut -d" " -f1; }
+# What differs from the state policy-up sets: the firewall table as loaded, the
+# rules exactly as written, the unreachable fallback.
+state_errors() {
+  local f bad=""
+  [ "\$(fw_sig)" = "\$(cat /run/tunx/fw.sig 2>/dev/null)" ] || bad="firewall"
+  for f in \$fams; do
+    rule_is \$f $RULE_XRAY "from all uidrange \$XRAY_UID-\$XRAY_UID lookup main" || bad="\$bad rule\$f:$RULE_XRAY"
+    rule_is \$f $RULE_INBOUND "from all fwmark $MARK_INBOUND lookup main" || bad="\$bad rule\$f:$RULE_INBOUND"
+    rule_is \$f $RULE_TUN "from all lookup $TABLE" || bad="\$bad rule\$f:$RULE_TUN"
+    ip \$f route show table $TABLE | grep -q "^unreachable default" || bad="\$bad route\$f:unreachable"
+  done
+  echo "\$bad"
+}
 # rule_set FAMILY PRIORITY SELECTOR...: replace the rule at PRIORITY.
 rule_set() { rule_del "\$1" "\$2"; ip "\$1" rule add "\${@:3}" priority "\$2"; }
 
@@ -376,26 +397,43 @@ case "\${1:-}" in
     # stays blocked instead of leaving directly.
     for f in \$fams; do
       ip \$f route replace unreachable default metric 4096 table $TABLE || exit 1
-      ip \$f rule show | grep -q "^$RULE_TUN:" || ip \$f rule add lookup $TABLE priority $RULE_TUN || exit 1
+      # The catch-all is never absent: a correct copy at $((RULE_TUN - 1)) covers the
+      # moment its priority is cleaned up.
+      if ! rule_is \$f $RULE_TUN "from all lookup $TABLE"; then
+        ip \$f rule add lookup $TABLE priority $((RULE_TUN - 1)) || exit 1
+        rule_del \$f $RULE_TUN
+        ip \$f rule add lookup $TABLE priority $RULE_TUN || exit 1
+        rule_del \$f $((RULE_TUN - 1))
+      fi
       rule_set \$f $RULE_XRAY uidrange "\$XRAY_UID-\$XRAY_UID" lookup main
       rule_set \$f $RULE_INBOUND fwmark $MARK_INBOUND lookup main
     done
     firewall_up || exit 1
+    fw_sig >/run/tunx/fw.sig
     ;;
   ensure)
-    # Put the rules and the firewall back if something removed them (for
-    # example "nft flush ruleset" from another tool).
-    missing=""
-    nft list table inet tunx >/dev/null 2>&1 || missing="firewall"
-    for f in \$fams; do
-      for p in $RULE_XRAY $RULE_INBOUND $RULE_TUN; do
-        ip \$f rule show | grep -q "^\$p:" || missing="\$missing rule\$f:\$p"
-      done
-    done
-    if [ -n "\$missing" ]; then
-      echo "missing:\$missing; restoring"
-      exec "\$0" policy-up
+    # Put everything back if another tool changed it (e.g. "nft flush ruleset").
+    # Exit 4 if it is still wrong afterwards, so the guard backs off.
+    bad=\$(state_errors)
+    if [ -n "\$bad" ]; then
+      echo "changed:\$bad; restoring"
+      exec 9>&-
+      "\$0" policy-up
+      exec 9>/run/tunx/lock; flock 9
+      bad=\$(state_errors)
+      if [ -n "\$bad" ]; then echo "still wrong:\$bad"; exit 4; fi
     fi
+    ;;
+  watch)
+    # React to rule, route and nftables changes at once, and check every 10
+    # seconds anyway. Exits when a monitor stops; systemd starts it again.
+    exec 3< <(nft monitor 2>/dev/null & ip monitor rule route 2>/dev/null & wait)
+    while :; do
+      "\$0" ensure; [ \$? -ne 4 ] || sleep 10
+      read -r -t 10 _ <&3; rc=\$?
+      [ \$rc -eq 0 ] || [ \$rc -gt 128 ] || exit 1
+      while read -r -t 0.05 _ <&3; do :; done
+    done
     ;;
   policy-down)
     for f in \$fams; do
@@ -417,7 +455,7 @@ case "\${1:-}" in
         ip -6 route replace default dev "\$TUN_NAME" metric 10 table $TABLE || true
     fi
     ;;
-  *) echo "usage: \$0 policy-up|policy-down|ensure|tun-up" >&2; exit 2 ;;
+  *) echo "usage: \$0 policy-up|policy-down|ensure|watch|tun-up" >&2; exit 2 ;;
 esac
 EOF
     chmod 755 "$NET_SCRIPT"
@@ -471,24 +509,16 @@ WantedBy=multi-user.target
 EOF
     cat >"$UNIT_GUARD" <<EOF
 [Unit]
-Description=Restore Xray TUN routing and firewall if removed
+Description=Restore Xray TUN routing and firewall if changed
 After=tunx-policy.service
 
 [Service]
-Type=oneshot
-ExecStart=$NET_SCRIPT ensure
-EOF
-    cat >"$UNIT_GUARD_TIMER" <<EOF
-[Unit]
-Description=Check Xray TUN routing and firewall every 30 seconds
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
-AccuracySec=5s
+ExecStart=$NET_SCRIPT watch
+Restart=always
+RestartSec=2
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
 }
 
@@ -584,13 +614,18 @@ cmd_install() {
     write_net_env
     write_net_script
     write_units
+    # Older versions ran the guard from a timer.
+    if [ -e /etc/systemd/system/tunx-guard.timer ]; then
+        systemctl disable --now tunx-guard.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/tunx-guard.timer
+    fi
 
     systemctl daemon-reload
     systemctl stop tunx.service 2>/dev/null || true
     # Not a restart: stopping the policy unit would drop the rules for a moment.
     "$NET_SCRIPT" policy-up
-    systemctl enable --now tunx-policy.service tunx.service tunx-guard.timer >/dev/null 2>&1
-    systemctl restart tunx.service
+    systemctl enable --now tunx-policy.service tunx.service tunx-guard.service >/dev/null 2>&1
+    systemctl restart tunx.service tunx-guard.service
     setup_dns
     if [ "$starter" -eq 1 ]; then
         warn "the starter config has no real upstream yet: public traffic is blocked until you edit $CONFIG and run: sudo $0 reload"
@@ -636,7 +671,9 @@ cmd_reload() {
 }
 
 cmd_uninstall() {
-    systemctl disable --now tunx-guard.timer tunx.service tunx-policy.service >/dev/null 2>&1 || true
+    # The guard first, or it would put the rules back.
+    systemctl disable --now tunx-guard.service >/dev/null 2>&1 || true
+    systemctl disable --now tunx.service tunx-policy.service >/dev/null 2>&1 || true
     if [ -x "$NET_SCRIPT" ]; then "$NET_SCRIPT" policy-down 2>/dev/null || true; fi
     if [ -e "$CONFIG" ]; then
         local saved
@@ -644,7 +681,7 @@ cmd_uninstall() {
         install -m 600 "$CONFIG" "$saved"
         log "Config saved to $saved"
     fi
-    rm -f "$UNIT_TUN" "$UNIT_POLICY" "$UNIT_GUARD" "$UNIT_GUARD_TIMER" "$NET_SCRIPT" "$BIN"
+    rm -f "$UNIT_TUN" "$UNIT_POLICY" "$UNIT_GUARD" "$NET_SCRIPT" "$BIN"
     rm -rf "$ASSET_DIR" "$CONF_DIR"
     systemctl daemon-reload
     restore_dns
@@ -662,6 +699,7 @@ cmd_uninstall() {
 cmd_status() {
     load_env
     systemctl --no-pager --lines=5 status tunx.service 2>/dev/null | sed -n '1,5p' || true
+    echo "Guard: $(systemctl is-active tunx-guard.service 2>/dev/null)"
     echo
     echo "Rules:"; ip rule show | grep -E "^($RULE_XRAY|$RULE_INBOUND|$RULE_TUN):" || echo "  (none)"
     echo "Table $TABLE:"; ip route show table $TABLE 2>/dev/null || true
