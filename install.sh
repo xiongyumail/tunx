@@ -24,6 +24,9 @@ RULE_TUN=9100
 # Connections opened from outside through a physical interface get this mark,
 # so their replies can leave the same way.
 MARK_INBOUND=0x2a
+# Connections opened by Xray get this conntrack mark, so packets the kernel still
+# sends after Xray has closed the socket (remaining data, FIN, RST) are let out.
+MARK_XRAY=0x2b
 
 BIN=/usr/local/bin/xray
 # Xray runs as this system user; only its sockets bypass the TUN.
@@ -291,8 +294,9 @@ write_net_script() {
 # unreachable, so traffic fails closed while Xray is down.
 # Routing alone cannot stop a program that binds its socket to a physical
 # interface: when the lookup fails, the kernel sends it out as if on-link. The
-# nftables table drops such packets unless they belong to the Xray user, reply to
-# an inbound connection, or are link-level (broadcast, multicast, DHCP).
+# nftables table drops such packets unless they belong to a connection of the Xray
+# user, reply to an inbound connection, or are link-level (broadcast, multicast,
+# DHCP).
 set -u
 . $CONF_DIR/net.env
 # IPv6 rules only when the kernel has IPv6.
@@ -319,7 +323,9 @@ table inet tunx {
     type filter hook output priority filter; policy accept;
     $wsl_dns
     oifname { "lo", "\$TUN_NAME" } accept
-    meta skuid \$XRAY_UID accept
+    # The owner of a socket is only visible while a process holds it.
+    meta skuid \$XRAY_UID ct mark set $MARK_XRAY accept
+    ct mark $MARK_XRAY accept
     meta mark $MARK_INBOUND accept
     ip daddr { 255.255.255.255, 224.0.0.0/4 } accept
     ip6 daddr { ff00::/8, fe80::/10 } accept
