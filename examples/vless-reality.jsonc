@@ -1,0 +1,78 @@
+// Example: upstream is a VLESS + Reality server (e.g. a 3x-ui inbound).
+// Copy, fill in the <...> values from the client share link, then:
+//   sudo ./install.sh install --config examples/my.jsonc
+// Share link fields: vless://<id>@<address>:<port>?pbk=<publicKey>&sni=<serverName>&sid=<shortId>&fp=<fingerprint>
+{
+  "log": { "loglevel": "warning", "access": "none" },
+
+  // Built-in DNS with cache; it answers the system's A/AAAA queries over DoH
+  // through the proxy. The upstream hostname cannot be resolved through the proxy
+  // itself, so the first server resolves it directly.
+  // If <address> is an IP, the first server can be removed.
+  "dns": {
+    "tag": "dns-internal",
+    "queryStrategy": "UseIP",
+    "serveStale": true,
+    "serveExpiredTTL": 3600,
+    "servers": [
+      { "address": "https://223.5.5.5/dns-query", "domains": [ "full:<address>" ],
+        "skipFallback": true, "queryStrategy": "UseIPv4" },
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query"
+    ]
+  },
+
+  "inbounds": [
+    {
+      "tag": "tun-in",
+      "port": 0,
+      "protocol": "tun",
+      "settings": { "name": "tunx0", "mtu": 1500, "autoOutboundsInterface": "eth0" },
+      "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
+    }
+  ],
+
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [ { "address": "<address>", "port": 443,
+                     "users": [ { "id": "<id>", "encryption": "none", "flow": "" } ] } ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "<serverName>",
+          "fingerprint": "chrome",
+          "publicKey": "<publicKey>",
+          "shortId": "<shortId>",
+          "spiderX": "/"
+        },
+        "sockopt": { "domainStrategy": "UseIPv4" }
+      }
+    },
+    { "tag": "direct", "protocol": "freedom" },
+    // A/AAAA go to the built-in DNS above; other types are forwarded through the proxy.
+    { "tag": "dns-out", "protocol": "dns",
+      "settings": { "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
+      "streamSettings": { "sockopt": { "dialerProxy": "proxy" } } },
+    { "tag": "block", "protocol": "blackhole" }
+  ],
+
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "inboundTag": [ "dns-internal" ], "ip": [ "223.5.5.5" ], "outboundTag": "direct" },
+      { "inboundTag": [ "dns-internal" ], "outboundTag": "proxy" },
+      {
+        "ip": [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+                "100.64.0.0/10", "127.0.0.0/8", "fc00::/7", "fe80::/10", "::1/128" ],
+        "outboundTag": "direct"
+      },
+      { "port": "53", "outboundTag": "dns-out" },
+      { "network": "tcp,udp", "outboundTag": "proxy" }
+    ]
+  }
+}
