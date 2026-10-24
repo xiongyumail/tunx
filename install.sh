@@ -486,6 +486,8 @@ cmd_tz() {
     # Otherwise WSL resets the time zone to the Windows one at every start.
     if is_wsl; then wsl_conf_set time useWindowsTimezone false; fi
     timedatectl set-timezone "$tz"
+    # Debian-based systems also keep the name here; Java and tzlocal read it first.
+    if [ -e /etc/timezone ]; then echo "$tz" >/etc/timezone; fi
     log "Time zone set to $tz (was ${cur:-unknown})"
 }
 
@@ -518,7 +520,10 @@ cmd_uninstall() {
     systemctl daemon-reload
     restore_dns
     if [ -e "$STATE_DIR/timezone.orig" ]; then
-        timedatectl set-timezone "$(cat "$STATE_DIR/timezone.orig")" && log "Restored time zone $(cat "$STATE_DIR/timezone.orig")"
+        local tz
+        tz=$(cat "$STATE_DIR/timezone.orig")
+        timedatectl set-timezone "$tz" && log "Restored time zone $tz"
+        if [ -e /etc/timezone ]; then echo "$tz" >/etc/timezone; fi
     fi
     rm -rf "$STATE_DIR"
     log "Removed. Traffic now uses the normal route."

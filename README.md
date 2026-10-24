@@ -33,7 +33,7 @@ IPv6       : 2001:db8::7
 | `sudo ./install.sh uninstall` | Remove all files, restore `resolv.conf` and `wsl.conf`; the config is backed up to `/root/tunx-config-*.json` |
 | `./install.sh status` | Service, routing rules, and DNS status |
 | `./install.sh test` | Check the egress address for TCP, DNS, UDP (STUN), and IPv6 |
-| `sudo ./install.sh tz` | Optional: set the system time zone to that of the egress IP (looked up at ipinfo.io through the TUN). On WSL it also writes `useWindowsTimezone=false`, otherwise WSL resets it at every start. Uninstall restores both; rerun after changing the exit |
+| `sudo ./install.sh tz` | Optional: set the system time zone to that of the egress IP (looked up at ipinfo.io through the TUN). It also updates `/etc/timezone` where it exists (read first by Java and tzlocal). On WSL it also writes `useWindowsTimezone=false`, otherwise WSL resets it at every start. Uninstall restores both; rerun after changing the exit |
 
 Install options:
 
