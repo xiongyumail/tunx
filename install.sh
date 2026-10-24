@@ -193,12 +193,14 @@ write_starter_config() {
     "rules": [
       { "inboundTag": [ "dns-internal" ], "ip": [ "223.5.5.5" ], "outboundTag": "direct" },
       { "inboundTag": [ "dns-internal" ], "outboundTag": "proxy" },
+      // All DNS, also to LAN resolvers (DHCP-configured ones used by systemd-resolved
+      // or NetworkManager), is answered here so no query leaves directly.
+      { "port": "53", "outboundTag": "dns-out" },
       {
         "ip": [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
                 "100.64.0.0/10", "127.0.0.0/8", "fc00::/7", "fe80::/10", "::1/128" ],
         "outboundTag": "direct"
       },
-      { "port": "53", "outboundTag": "dns-out" },
       // Add domain or IP rules here, e.g.
       // { "domain": [ "geosite:cn" ], "outboundTag": "direct" },
       { "network": "tcp,udp", "outboundTag": "proxy" }
@@ -274,6 +276,12 @@ write_net_env() {
 }
 
 write_net_script() {
+    # WSL answers DNS on 10.255.255.254, which sits on lo and so never enters the
+    # TUN: queries sent there would leave through Windows. tunx does not use it.
+    local wsl_dns=""
+    if is_wsl; then
+        wsl_dns='ip daddr 10.255.255.254 meta l4proto { tcp, udp } th dport 53 counter drop'
+    fi
     cat >"$NET_SCRIPT" <<EOF
 #!/bin/bash
 # Policy routing and firewall for the Xray TUN (managed by tunx).
@@ -287,6 +295,8 @@ write_net_script() {
 # an inbound connection, or are link-level (broadcast, multicast, DHCP).
 set -u
 . $CONF_DIR/net.env
+# IPv6 rules only when the kernel has IPv6.
+fams="-4"; [ -e /proc/net/if_inet6 ] && fams="-4 -6"
 
 rule_del() { while ip "\$1" rule show | grep -q "^\$2:"; do ip "\$1" rule del priority "\$2"; done; }
 # rule_set FAMILY PRIORITY SELECTOR...: replace the rule at PRIORITY.
@@ -307,6 +317,7 @@ table inet tunx {
   }
   chain out {
     type filter hook output priority filter; policy accept;
+    $wsl_dns
     oifname { "lo", "\$TUN_NAME" } accept
     meta skuid \$XRAY_UID accept
     meta mark $MARK_INBOUND accept
@@ -322,18 +333,20 @@ NFT
 
 case "\${1:-}" in
   policy-up)
-    # Safe to rerun: the firewall, the catch-all rule and the unreachable
-    # fallback stay in place, so refreshing the bypass rules can only block.
-    firewall_up || exit 1
-    for f in -4 -6; do
-      ip \$f route replace unreachable default metric 4096 table $TABLE
-      ip \$f rule show | grep -q "^$RULE_TUN:" || ip \$f rule add lookup $TABLE priority $RULE_TUN
+    # Safe to rerun: the catch-all rule and the unreachable fallback stay in
+    # place, so refreshing the bypass rules can only block. Routing comes first:
+    # if the firewall fails, the unit fails, Xray is not started and traffic
+    # stays blocked instead of leaving directly.
+    for f in \$fams; do
+      ip \$f route replace unreachable default metric 4096 table $TABLE || exit 1
+      ip \$f rule show | grep -q "^$RULE_TUN:" || ip \$f rule add lookup $TABLE priority $RULE_TUN || exit 1
       rule_set \$f $RULE_XRAY uidrange "\$XRAY_UID-\$XRAY_UID" lookup main
       rule_set \$f $RULE_INBOUND fwmark $MARK_INBOUND lookup main
     done
+    firewall_up || exit 1
     ;;
   policy-down)
-    for f in -4 -6; do
+    for f in \$fams; do
       rule_del \$f $RULE_TUN
       rule_del \$f $RULE_INBOUND
       rule_del \$f $RULE_XRAY
@@ -345,10 +358,12 @@ case "\${1:-}" in
     for _ in \$(seq 50); do ip link show "\$TUN_NAME" >/dev/null 2>&1 && break; sleep 0.2; done
     ip link set "\$TUN_NAME" up
     ip addr replace $TUN_ADDR dev "\$TUN_NAME"
-    ip -6 addr replace $TUN_ADDR6 dev "\$TUN_NAME" nodad
-    for f in -4 -6; do
-      ip \$f route replace default dev "\$TUN_NAME" metric 10 table $TABLE
-    done
+    ip route replace default dev "\$TUN_NAME" metric 10 table $TABLE
+    # Without IPv6 on the TUN, IPv6 simply stays unreachable.
+    if [ "\$fams" != "-4" ]; then
+      ip -6 addr replace $TUN_ADDR6 dev "\$TUN_NAME" nodad &&
+        ip -6 route replace default dev "\$TUN_NAME" metric 10 table $TABLE || true
+    fi
     ;;
   *) echo "usage: \$0 policy-up|policy-down|tun-up" >&2; exit 2 ;;
 esac
@@ -373,7 +388,8 @@ Conflicts=shutdown.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$NET_SCRIPT policy-up
-ExecStop=$NET_SCRIPT policy-down
+# No ExecStop: stopping the unit (or shutting down) must not open the network.
+# Only uninstall removes the rules.
 
 [Install]
 WantedBy=multi-user.target
@@ -578,6 +594,7 @@ cmd_status() {
     echo "Table $TABLE:"; ip route show table $TABLE 2>/dev/null || true
     echo "IPv6 table $TABLE:"; ip -6 route show table $TABLE 2>/dev/null || true
     echo "Interface:"; ip -br addr show "$TUN_NAME" 2>/dev/null || echo "  $TUN_NAME missing"
+    echo "Firewall:"; nft list table inet tunx 2>/dev/null | awk '/counter/ {printf "  dropped %s packets\n", $(NF-3)}' | tail -1 || true
     echo "DNS:"; grep '^nameserver' /etc/resolv.conf || true
 }
 
