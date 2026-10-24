@@ -55,6 +55,7 @@ Reinstalling with the same version skips the download.
 - Exactly one `tun` inbound, with `name` equal to `--tun-name` (default `tunx0`).
 - Do not set `autoSystemRoutingTable` on the TUN inbound; routes are managed by the script.
 - **Upstream as a hostname**: it cannot be resolved through the upstream itself. List it in the `domains` of a DNS server queried directly (`https://223.5.5.5/dns-query` with `skipFallback: true` in the examples), and route that server's address with `inboundTag: dns-internal` to the `direct` outbound. When the config has a `dns` outbound, `check` fails if an upstream hostname is not listed. See `examples/`.
+- **DNS rule order**: with a `dns` outbound, a rule sending port 53 to it must exist and come before any IP rule or catch-all (e.g. the private-address `direct` rule or `geoip:cn`), otherwise DNS sent to those addresses leaves without the built-in DNS. `check` fails if not; install and reload stop before changing anything.
 - To split by domain, enable `sniffing` on the TUN inbound (`routeOnly: true`), then add `domain` rules.
 
 Examples:

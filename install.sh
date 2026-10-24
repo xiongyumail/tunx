@@ -266,6 +266,35 @@ if any(o.get("protocol") == "dns" for o in cfg.get("outbounds") or []):
                 errors.append("outbound %r address %r is not listed in any dns server "
                               "\x27domains\x27: add \x22full:%s\x22 to the directly queried server"
                               % (o.get("tag"), host, host))
+# The port 53 rule must come before any rule that would catch DNS packets first
+# (IP rules, catch-alls), or DNS sent to those addresses skips the built-in DNS
+# and leaves directly, e.g. queries to a LAN resolver.
+dns_tags = {o.get("tag") for o in cfg.get("outbounds") or [] if o.get("protocol") == "dns"}
+if dns_tags:
+    def has53(port):
+        if port is None:
+            return True
+        for part in str(port).split(","):
+            lo, _, hi = part.strip().partition("-")
+            if lo.isdigit() and int(lo) <= 53 <= int(hi or lo):
+                return True
+        return False
+    rules = (cfg.get("routing") or {}).get("rules") or []
+    dns_rule = next((i for i, x in enumerate(rules) if x.get("outboundTag") in dns_tags
+                     and not x.get("inboundTag") and x.get("port") is not None
+                     and has53(x.get("port"))), None)
+    if dns_rule is None:
+        errors.append("no routing rule sends port 53 to the dns outbound")
+    else:
+        for i, x in enumerate(rules[:dns_rule]):
+            if (x.get("inboundTag") or x.get("outboundTag") in dns_tags
+                    or set(x) - {"ip", "network", "port", "outboundTag", "balancerTag", "ruleTag", "type"}
+                    or not has53(x.get("port"))):
+                continue
+            errors.append("routing rule %d (to %r) comes before the port 53 rule, so DNS "
+                          "sent to its addresses leaves without the built-in DNS: move "
+                          "{\x22port\x22: \x2253\x22, ...} above it"
+                          % (i + 1, x.get("outboundTag") or x.get("balancerTag")))
 for e in errors:
     print("ERROR: " + e, file=sys.stderr)
 sys.exit(1 if errors else 0)
@@ -531,7 +560,6 @@ cmd_install() {
     done
     [[ "$TUN_NAME" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || die "bad --tun-name: $TUN_NAME (1-15 chars: letters, digits, _ . -)"
     check_deps
-    ensure_user
 
     install_xray "$version" "$zip" "$via"
     local starter=0
@@ -551,6 +579,7 @@ cmd_install() {
         write_starter_config
         starter=1
     fi
+    ensure_user
     protect_config
     write_net_env
     write_net_script
