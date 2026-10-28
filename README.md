@@ -132,7 +132,9 @@ Examples:
 - `sudo tests/static.sh`: shell syntax and ShellCheck, and the generated policy script and nftables ruleset for the normal, WSL and gateway modes (`nft -c`, nothing is loaded).
 - `tests/config.sh`: downloads Xray into a temp dir, checks the examples and the starter config, and checks that broken configs are rejected.
 
-Both run in GitHub Actions on every push.
+- `sudo tests/vm.sh`: installs tunx with `--gateway` in a Debian 13 KVM VM, with a SOCKS5 upstream on the host and a client in a network namespace. It checks the VM's own egress, that the client's TCP, UDP and DNS go through the gateway and mainland China addresses go direct, that the client is cut off while Xray is stopped (and the VM still answers SSH), recovery after `kill -9`, the guard restoring flushed rules, reboot, and uninstall. It changes the host network, so run it only on a throwaway machine.
+
+The first two run in GitHub Actions on every push, the VM test when `install.sh`, the examples or the test change.
 
 ## License
 

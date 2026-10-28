@@ -1,0 +1,36 @@
+name: VM test
+
+# Installs tunx in a KVM VM and tests gateway mode with a client (tests/vm.sh).
+# Slower than CI, so only when the script, the examples or this test change.
+on:
+  push:
+    paths: [ install.sh, examples/**, tests/vm.sh, .github/workflows/vm.yml ]
+  pull_request:
+    paths: [ install.sh, examples/**, tests/vm.sh, .github/workflows/vm.yml ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vm:
+    name: Gateway VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage dnsutils
+      - name: VM test
+        run: sudo TUNX_VM_LOGS="$RUNNER_TEMP/vm-logs" tests/vm.sh
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-logs
+          path: ${{ runner.temp }}/vm-logs
