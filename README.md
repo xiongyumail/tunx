@@ -45,8 +45,27 @@ Install options:
 | `--zip PATH` | none | Offline install from a local `Xray-linux-*.zip` |
 | `--proxy URL` | none | Proxy used only to download Xray, e.g. `socks5h://192.168.1.10:1080` |
 | `--tun-name NAME` | `tunx0` | TUN interface name, at most 15 characters; must match `name` in the config |
+| `--gateway` | off | Gateway mode, see below. Kept on later installs until uninstall |
 
 Reinstalling with the same version skips the download.
+
+## Gateway mode
+
+With `--gateway`, the host also serves LAN clients that use it as their default gateway (e.g. a small VM on the LAN). Their TCP and UDP traffic enters the TUN and follows the same Xray routing; the host's own traffic is handled as before.
+
+```bash
+sudo ./install.sh install --gateway --config examples/gateway.jsonc
+```
+
+On a client, set the gateway to this host and the DNS server to any public address (e.g. `223.5.5.5`): port 53 traffic passing through is answered by Xray's built-in DNS. A DNS server on the LAN is reached directly, not through the gateway. `examples/gateway.jsonc` returns only IPv4 addresses, because clients usually get IPv6 routes from the router and IPv6 would bypass the gateway.
+
+What changes in this mode:
+
+- Only connections addressed to the host itself are marked as inbound. Forwarded connections are not, so they go to table 100 and the TUN.
+- Rule `8997` sends packets that Xray writes back for clients (coming in on the TUN) to the main table, so they leave through the LAN interface.
+- Rule `8996` sends ICMP to the main table: the TUN carries only TCP and UDP, so a client's ping goes to the router as is.
+- The firewall gets a `gateway` chain on the forward hook that only lets traffic into or out of the TUN, plus ICMP. If Xray is down, clients are cut off instead of being forwarded directly.
+- `/etc/sysctl.d/90-tunx-gateway.conf` turns on forwarding, turns off ICMP redirects (they would tell clients to bypass the host), sets loose reverse path filtering, and lets inbound connections route by their mark (`src_valid_mark`, `tcp_fwmark_accept`). The last two keep the host reachable over SSH while Xray is down. Uninstall removes the file and restores the previous values.
 
 ## Config requirements
 
@@ -62,6 +81,7 @@ Examples:
 
 - `examples/vless-reality.jsonc`: a VLESS + Reality upstream; the fields map to a 3x-ui share link.
 - `examples/socks-split.jsonc`: two SOCKS5 upstreams, `geosite:cn` direct, specific domains to the second upstream.
+- `examples/gateway.jsonc`: for gateway mode; a SOCKS5 upstream on the LAN, mainland China direct, IPv4-only DNS answers.
 
 ## How it works
 
@@ -102,8 +122,8 @@ Examples:
 ## Notes
 
 - Existing `http_proxy`-style environment variables and APT/Git proxy settings are left alone. Once the TUN is working they can be removed; the script warns if it finds proxy environment variables still set.
-- Tested on WSL2.
-- Only traffic of this Linux host (or WSL distribution) is covered. On WSL, Windows programs, including ones started from WSL, use the Windows network.
+- Tested on WSL2, and in gateway mode on a Debian 13 VM.
+- Without `--gateway`, only traffic of this Linux host (or WSL distribution) is covered. On WSL, Windows programs, including ones started from WSL, use the Windows network.
 - Whether IPv6 reaches the internet depends on the upstream's exit. If it has no IPv6, IPv6 connections fail and programs fall back to IPv4; nothing leaves directly either way.
 - Xray's TUN inbound is a fairly new feature; verify on your machine before changing versions.
 

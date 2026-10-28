@@ -1,0 +1,59 @@
+// Example for gateway mode (install --gateway): LAN clients use this host as
+// their gateway. Mainland China sites go direct, everything else goes to a
+// SOCKS5 proxy on the LAN (UDP must be enabled on it).
+// DNS sent through the gateway to any public address is answered by the
+// built-in DNS. Only IPv4 addresses are returned: clients usually get IPv6
+// routes from the router, so IPv6 connections would not pass through here.
+{
+  "log": { "loglevel": "warning", "access": "none" },
+
+  "dns": {
+    "tag": "dns-internal",
+    "queryStrategy": "UseIPv4",
+    "serveStale": true,
+    "serveExpiredTTL": 3600,
+    "servers": [
+      { "address": "https://223.5.5.5/dns-query", "domains": [ "geosite:cn" ], "skipFallback": true },
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query"
+    ]
+  },
+
+  "inbounds": [
+    {
+      "tag": "tun-in",
+      "port": 0,
+      "protocol": "tun",
+      "settings": { "name": "tunx0", "mtu": 1500 },
+      "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
+    }
+  ],
+
+  "outbounds": [
+    { "tag": "proxy", "protocol": "socks",
+      "settings": { "servers": [ { "address": "192.168.1.10", "port": 1080 } ] } },
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "dns-out", "protocol": "dns",
+      "settings": { "rewriteAddress": "1.1.1.1", "rewritePort": 53,
+                    "rules": [ { "action": "hijack", "qType": "1,28" }, { "action": "direct" } ] },
+      "streamSettings": { "sockopt": { "dialerProxy": "proxy" } } },
+    { "tag": "block", "protocol": "blackhole" }
+  ],
+
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      { "inboundTag": [ "dns-internal" ], "ip": [ "223.5.5.5" ], "outboundTag": "direct" },
+      { "inboundTag": [ "dns-internal" ], "outboundTag": "proxy" },
+      { "port": "53", "outboundTag": "dns-out" },
+      {
+        "ip": [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+                "100.64.0.0/10", "127.0.0.0/8", "fc00::/7", "fe80::/10", "::1/128" ],
+        "outboundTag": "direct"
+      },
+      { "domain": [ "geosite:cn" ], "outboundTag": "direct" },
+      { "ip": [ "geoip:cn" ], "outboundTag": "direct" },
+      { "network": "tcp,udp", "outboundTag": "proxy" }
+    ]
+  }
+}

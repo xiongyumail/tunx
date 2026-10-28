@@ -20,6 +20,10 @@ TUN_ADDR6="fdfe:dcba:9876::1/126"
 TABLE=100
 RULE_XRAY=8991
 RULE_INBOUND=8995
+# Gateway mode only: packets Xray writes back for forwarded clients, and ICMP
+# from clients (the TUN carries only TCP and UDP), use the main table.
+RULE_ICMP=8996
+RULE_TUNBACK=8997
 RULE_TUN=9100
 # Connections opened from outside through a physical interface get this mark,
 # so their replies can leave the same way.
@@ -40,6 +44,8 @@ UNIT_TUN=/etc/systemd/system/tunx.service
 UNIT_GUARD=/etc/systemd/system/tunx-guard.service
 STATE_DIR=/var/lib/tunx
 NM_CONF=/etc/NetworkManager/conf.d/90-tunx.conf
+SYSCTL_CONF=/etc/sysctl.d/90-tunx-gateway.conf
+GATEWAY=0
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -66,6 +72,8 @@ Install options:
   --zip PATH           Use a local Xray-linux-*.zip instead of downloading
   --proxy URL          Proxy for downloading Xray, e.g. socks5h://192.168.1.10:1080
   --tun-name NAME      TUN interface name (default: $TUN_NAME)
+  --gateway            Also forward the traffic of LAN clients that use this host
+                       as their gateway into the TUN (kept on later installs)
 EOF
 }
 
@@ -306,13 +314,30 @@ write_net_env() {
     {
         printf 'TUN_NAME="%s"\n' "$TUN_NAME"
         printf 'XRAY_UID="%s"\n' "$(id -u "$XRAY_USER")"
+        printf 'GATEWAY="%s"\n' "$GATEWAY"
     } >"$CONF_DIR/net.env"
 }
 
 write_net_script() {
     # WSL answers DNS on 10.255.255.254, which sits on lo and so never enters the
     # TUN: queries sent there would leave through Windows. tunx does not use it.
-    local wsl_dns=""
+    local wsl_dns="" inbound_match="" inbound_skb="" forward_chain=""
+    if [ "$GATEWAY" = 1 ]; then
+        # Forwarded connections are not inbound: they must enter the TUN.
+        inbound_match="fib daddr type local"
+        # Inbound packets carry the mark too, so with tcp_fwmark_accept an accepted
+        # socket (e.g. SSH) routes by the main table from its first reply; the
+        # host stays reachable while Xray is down.
+        inbound_skb="ct mark $MARK_INBOUND meta mark set $MARK_INBOUND"
+        # Forwarding is allowed only into and out of the TUN, plus ICMP.
+        forward_chain="chain gateway {
+    type filter hook forward priority filter; policy accept;
+    iifname \"\$TUN_NAME\" accept
+    oifname \"\$TUN_NAME\" accept
+    meta l4proto { icmp, ipv6-icmp } accept
+    counter drop
+  }"
+    fi
     if is_wsl; then
         wsl_dns='ip daddr 10.255.255.254 meta l4proto { tcp, udp } th dport 53 counter drop'
     fi
@@ -339,7 +364,7 @@ case "\${1:-}" in policy-up|policy-down|ensure) exec 9>/run/tunx/lock; flock 9 ;
 
 rule_del() { while ip "\$1" rule show | grep -q "^\$2:"; do ip "\$1" rule del priority "\$2"; done; }
 # rule_is FAMILY PRIORITY TEXT: exactly one rule at PRIORITY, reading TEXT.
-rule_is() { [ "\$(ip "\$1" rule show priority "\$2" | sed 's/^[0-9]*:[[:space:]]*//; s/[[:space:]]*\$//')" = "\$3" ]; }
+rule_is() { [ "\$(ip "\$1" rule show priority "\$2" | sed 's/^[0-9]*:[[:space:]]*//; s/ \[detached\]//; s/[[:space:]]*\$//')" = "\$3" ]; }
 # Fingerprint of the firewall table without its counters.
 fw_sig() { nft list table inet tunx 2>/dev/null | sed -E 's/counter packets [0-9]+ bytes [0-9]+/counter/' | sha256sum | cut -d" " -f1; }
 # What differs from the state policy-up sets: the firewall table as loaded, the
@@ -351,8 +376,14 @@ state_errors() {
     rule_is \$f $RULE_XRAY "from all uidrange \$XRAY_UID-\$XRAY_UID lookup main" || bad="\$bad rule\$f:$RULE_XRAY"
     rule_is \$f $RULE_INBOUND "from all fwmark $MARK_INBOUND lookup main" || bad="\$bad rule\$f:$RULE_INBOUND"
     rule_is \$f $RULE_TUN "from all lookup $TABLE" || bad="\$bad rule\$f:$RULE_TUN"
+    if [ "\$GATEWAY" = 1 ]; then
+      rule_is \$f $RULE_TUNBACK "from all iif \$TUN_NAME lookup main" || bad="\$bad rule\$f:$RULE_TUNBACK"
+    fi
     ip \$f route show table $TABLE | grep -q "^unreachable default" || bad="\$bad route\$f:unreachable"
   done
+  if [ "\$GATEWAY" = 1 ]; then
+    rule_is -4 $RULE_ICMP "from all ipproto icmp lookup main" || bad="\$bad rule-4:$RULE_ICMP"
+  fi
   echo "\$bad"
 }
 # rule_set FAMILY PRIORITY SELECTOR...: replace the rule at PRIORITY.
@@ -365,8 +396,10 @@ delete table inet tunx
 table inet tunx {
   chain pre {
     type filter hook prerouting priority mangle; policy accept;
-    iifname != { "lo", "\$TUN_NAME" } ct state new ct mark set $MARK_INBOUND
+    iifname != { "lo", "\$TUN_NAME" } ct state new $inbound_match ct mark set $MARK_INBOUND
+    $inbound_skb
   }
+  $forward_chain
   chain route {
     type route hook output priority mangle; policy accept;
     ct mark $MARK_INBOUND meta mark set $MARK_INBOUND
@@ -407,7 +440,17 @@ case "\${1:-}" in
       fi
       rule_set \$f $RULE_XRAY uidrange "\$XRAY_UID-\$XRAY_UID" lookup main
       rule_set \$f $RULE_INBOUND fwmark $MARK_INBOUND lookup main
+      if [ "\$GATEWAY" = 1 ]; then
+        rule_set \$f $RULE_TUNBACK iif "\$TUN_NAME" lookup main
+      else
+        rule_del \$f $RULE_TUNBACK
+      fi
     done
+    if [ "\$GATEWAY" = 1 ]; then
+      rule_set -4 $RULE_ICMP ipproto icmp lookup main
+    else
+      rule_del -4 $RULE_ICMP
+    fi
     firewall_up || exit 1
     fw_sig >/run/tunx/fw.sig
     ;;
@@ -438,10 +481,12 @@ case "\${1:-}" in
   policy-down)
     for f in \$fams; do
       rule_del \$f $RULE_TUN
+      rule_del \$f $RULE_TUNBACK
       rule_del \$f $RULE_INBOUND
       rule_del \$f $RULE_XRAY
       ip \$f route flush table $TABLE 2>/dev/null || true
     done
+    rule_del -4 $RULE_ICMP
     nft delete table inet tunx 2>/dev/null || true
     ;;
   tun-up)
@@ -574,6 +619,40 @@ restore_dns() {
     fi
 }
 
+# Gateway mode: forward packets, do not tell clients to bypass this host
+# (redirects), accept replies coming out of the TUN (loose reverse path), and
+# let inbound connections route by their mark (see firewall_up): the reverse
+# path check of their packets and the replies of accepted TCP sockets.
+# The previous values are kept and restored on uninstall.
+setup_gateway_sysctl() {
+    local k
+    install -d "$STATE_DIR"
+    touch "$STATE_DIR/sysctl.orig"
+    for k in net.ipv4.ip_forward net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects \
+             net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter net.ipv4.conf.all.src_valid_mark net.ipv4.tcp_fwmark_accept; do
+        grep -q "^$k=" "$STATE_DIR/sysctl.orig" || echo "$k=$(sysctl -n "$k")" >>"$STATE_DIR/sysctl.orig"
+    done
+    cat >"$SYSCTL_CONF" <<EOF
+# Managed by tunx (gateway mode)
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.ipv4.conf.all.src_valid_mark=1
+net.ipv4.tcp_fwmark_accept=1
+EOF
+    sysctl -q -p "$SYSCTL_CONF"
+    log "Gateway mode: forwarding enabled"
+}
+
+restore_gateway_sysctl() {
+    rm -f "$SYSCTL_CONF"
+    if [ -e "$STATE_DIR/sysctl.orig" ]; then
+        sysctl -q -p "$STATE_DIR/sysctl.orig" && log "Restored forwarding settings"
+    fi
+}
+
 cmd_install() {
     local config="" version="$XRAY_VERSION_DEFAULT" zip="" via=""
     load_env
@@ -584,6 +663,7 @@ cmd_install() {
             --zip) zip="$2"; shift 2 ;;
             --proxy) via="$2"; shift 2 ;;
             --tun-name) TUN_NAME="$2"; shift 2 ;;
+            --gateway) GATEWAY=1; shift ;;
             -h | --help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -626,6 +706,7 @@ cmd_install() {
     "$NET_SCRIPT" policy-up
     systemctl enable --now tunx-policy.service tunx.service tunx-guard.service >/dev/null 2>&1
     systemctl restart tunx.service tunx-guard.service
+    if [ "$GATEWAY" = 1 ]; then setup_gateway_sysctl; fi
     setup_dns
     if [ "$starter" -eq 1 ]; then
         warn "the starter config has no real upstream yet: public traffic is blocked until you edit $CONFIG and run: sudo $0 reload"
@@ -684,6 +765,7 @@ cmd_uninstall() {
     rm -f "$UNIT_TUN" "$UNIT_POLICY" "$UNIT_GUARD" "$NET_SCRIPT" "$BIN"
     rm -rf "$ASSET_DIR" "$CONF_DIR"
     systemctl daemon-reload
+    restore_gateway_sysctl
     restore_dns
     if [ -e "$STATE_DIR/timezone.orig" ]; then
         local tz
@@ -701,7 +783,8 @@ cmd_status() {
     systemctl --no-pager --lines=5 status tunx.service 2>/dev/null | sed -n '1,5p' || true
     echo "Guard: $(systemctl is-active tunx-guard.service 2>/dev/null)"
     echo
-    echo "Rules:"; ip rule show | grep -E "^($RULE_XRAY|$RULE_INBOUND|$RULE_TUN):" || echo "  (none)"
+    echo "Rules:"; ip rule show | grep -E "^($RULE_XRAY|$RULE_INBOUND|$RULE_ICMP|$RULE_TUNBACK|$RULE_TUN):" || echo "  (none)"
+    if [ "${GATEWAY:-0}" = 1 ]; then echo "Gateway: on (ip_forward=$(sysctl -n net.ipv4.ip_forward))"; fi
     echo "Table $TABLE:"; ip route show table $TABLE 2>/dev/null || true
     echo "IPv6 table $TABLE:"; ip -6 route show table $TABLE 2>/dev/null || true
     echo "Interface:"; ip -br addr show "$TUN_NAME" 2>/dev/null || echo "  $TUN_NAME missing"
