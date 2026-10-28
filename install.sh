@@ -376,12 +376,12 @@ state_errors() {
     rule_is \$f $RULE_XRAY "from all uidrange \$XRAY_UID-\$XRAY_UID lookup main" || bad="\$bad rule\$f:$RULE_XRAY"
     rule_is \$f $RULE_INBOUND "from all fwmark $MARK_INBOUND lookup main" || bad="\$bad rule\$f:$RULE_INBOUND"
     rule_is \$f $RULE_TUN "from all lookup $TABLE" || bad="\$bad rule\$f:$RULE_TUN"
-    if [ "\$GATEWAY" = 1 ]; then
+    if [ "\${GATEWAY:-0}" = 1 ]; then
       rule_is \$f $RULE_TUNBACK "from all iif \$TUN_NAME lookup main" || bad="\$bad rule\$f:$RULE_TUNBACK"
     fi
     ip \$f route show table $TABLE | grep -q "^unreachable default" || bad="\$bad route\$f:unreachable"
   done
-  if [ "\$GATEWAY" = 1 ]; then
+  if [ "\${GATEWAY:-0}" = 1 ]; then
     rule_is -4 $RULE_ICMP "from all ipproto icmp lookup main" || bad="\$bad rule-4:$RULE_ICMP"
   fi
   echo "\$bad"
@@ -472,13 +472,13 @@ case "\${1:-}" in
       fi
       rule_set \$f $RULE_XRAY uidrange "\$XRAY_UID-\$XRAY_UID" lookup main
       rule_set \$f $RULE_INBOUND fwmark $MARK_INBOUND lookup main
-      if [ "\$GATEWAY" = 1 ]; then
+      if [ "\${GATEWAY:-0}" = 1 ]; then
         rule_set \$f $RULE_TUNBACK iif "\$TUN_NAME" lookup main
       else
         rule_del \$f $RULE_TUNBACK
       fi
     done
-    if [ "\$GATEWAY" = 1 ]; then
+    if [ "\${GATEWAY:-0}" = 1 ]; then
       rule_set -4 $RULE_ICMP ipproto icmp lookup main
     else
       rule_del -4 $RULE_ICMP
