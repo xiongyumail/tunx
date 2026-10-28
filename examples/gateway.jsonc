@@ -1,9 +1,10 @@
 // Example for gateway mode (install --gateway): LAN clients use this host as
 // their gateway. Mainland China sites go direct, everything else goes to a
 // SOCKS5 proxy on the LAN (UDP must be enabled on it).
-// DNS sent through the gateway to any public address is answered by the
-// built-in DNS. Only IPv4 addresses are returned: clients usually get IPv6
-// routes from the router, so IPv6 connections would not pass through here.
+// DNS sent through the gateway to any public address, or to this host itself
+// (the "dns-in" inbound), is answered by the built-in DNS. Only IPv4 addresses
+// are returned: clients usually get IPv6 routes from the router, so IPv6
+// connections would not pass through here.
 {
   "log": { "loglevel": "warning", "access": "none" },
 
@@ -26,7 +27,11 @@
       "protocol": "tun",
       "settings": { "name": "tunx0", "mtu": 1500 },
       "sniffing": { "enabled": true, "destOverride": [ "http", "tls", "quic" ], "routeOnly": true }
-    }
+    },
+    // For clients that use this host as their DNS server. Port 53 must be free:
+    // turn off the systemd-resolved stub (DNSStubListener=no) if it runs.
+    { "tag": "dns-in", "listen": "0.0.0.0", "port": 53, "protocol": "dokodemo-door",
+      "settings": { "address": "1.1.1.1", "port": 53, "network": "tcp,udp" } }
   ],
 
   "outbounds": [
@@ -45,6 +50,7 @@
     "rules": [
       { "inboundTag": [ "dns-internal" ], "ip": [ "223.5.5.5" ], "outboundTag": "direct" },
       { "inboundTag": [ "dns-internal" ], "outboundTag": "proxy" },
+      { "inboundTag": [ "dns-in" ], "outboundTag": "dns-out" },
       { "port": "53", "outboundTag": "dns-out" },
       {
         "ip": [ "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",

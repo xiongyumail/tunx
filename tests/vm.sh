@@ -140,6 +140,10 @@ users:
     shell: /bin/bash
     ssh_authorized_keys: [ "$(cat "$work/key.pub")" ]
 packages: [ curl, unzip, nftables, python3, bind9-dnsutils ]
+write_files:
+  - path: /etc/systemd/resolved.conf.d/90-tunx.conf
+    content: "[Resolve]\\nDNSStubListener=no\\n"
+runcmd: [ [ systemctl, restart, systemd-resolved ] ]
 EOF
 genisoimage -quiet -output "$work/seed.iso" -volid cidata -joliet -rock \
     "$work/seed/user-data" "$work/seed/meta-data" "$work/seed/network-config"
@@ -177,6 +181,11 @@ ans=$(client dig +short +time=5 +tries=2 @192.0.2.53 example.com A | tr "\n" " "
 aaaa=$(client dig +short +time=5 +tries=2 @192.0.2.53 example.com AAAA)
 [ -z "$aaaa" ] || fail "gateway config should return no AAAA records, got $aaaa"
 ok "client DNS hijacked, IPv4 only ($ans)"
+
+ans=$(client dig +short +time=5 +tries=2 @$VM_IP example.com A | tr "\n" " ")
+[ -n "$ans" ] || fail "DNS server on the gateway (dns-in) does not answer"
+client dig +short +tcp +time=5 +tries=2 @$VM_IP example.com A | grep -q . || fail "DNS over TCP on the gateway"
+ok "gateway answers DNS on its own address, UDP and TCP"
 
 mark=$(log_mark)
 udp=$(client python3 -I - <<'EOF'

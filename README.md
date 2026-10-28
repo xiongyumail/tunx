@@ -57,7 +57,7 @@ With `--gateway`, the host also serves LAN clients that use it as their default 
 sudo ./install.sh install --gateway --config examples/gateway.jsonc
 ```
 
-On a client, set the gateway to this host and the DNS server to any public address (e.g. `223.5.5.5`): port 53 traffic passing through is answered by Xray's built-in DNS. A DNS server on the LAN is reached directly, not through the gateway. `examples/gateway.jsonc` returns only IPv4 addresses, because clients usually get IPv6 routes from the router and IPv6 would bypass the gateway.
+On a client, set the gateway to this host. For DNS, either point it at this host too (`examples/gateway.jsonc` listens on port 53; turn off the systemd-resolved stub first with `DNSStubListener=no` in `/etc/systemd/resolved.conf.d/`), or at any public address (e.g. `223.5.5.5`): port 53 traffic passing through is answered by Xray's built-in DNS. Another DNS server on the LAN is reached directly, not through the gateway. `examples/gateway.jsonc` returns only IPv4 addresses, because clients usually get IPv6 routes from the router and IPv6 would bypass the gateway.
 
 What changes in this mode:
 
