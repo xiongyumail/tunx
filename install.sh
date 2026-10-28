@@ -389,7 +389,25 @@ state_errors() {
 # rule_set FAMILY PRIORITY SELECTOR...: replace the rule at PRIORITY.
 rule_set() { rule_del "\$1" "\$2"; ip "\$1" rule add "\${@:3}" priority "\$2"; }
 
+# open_inbound 4|6: established TCP connections to a listening port, as nft
+# set elements (local address . port . peer address . port).
+open_inbound() {
+  local listen l r lp rp
+  listen=" \$(ss -Htln | awk '{n = split(\$4, a, ":"); print a[n]}' | sort -u | tr '\n' ' ') "
+  ss -Htn"\$1" state established | while read -r _ _ l r _; do
+    lp=\${l##*:}; rp=\${r##*:}
+    case "\$listen" in *" \$lp "*) ;; *) continue ;; esac
+    l=\${l%:*}; r=\${r%:*}; l=\${l#[}; l=\${l%]}; r=\${r#[}; r=\${r%]}
+    printf '%s . %s . %s . %s, ' "\${l%%\%*}" "\$lp" "\${r%%\%*}" "\$rp"
+  done
+}
+
 firewall_up() {
+  local open e4="" e6=""
+  open=\$(open_inbound 4); [ -z "\$open" ] || e4="elements = { \$open }"
+  if [ "\$fams" != "-4" ]; then
+    open=\$(open_inbound 6); [ -z "\$open" ] || e6="elements = { \$open }"
+  fi
   nft -f - <<NFT
 table inet tunx
 delete table inet tunx
@@ -400,8 +418,22 @@ table inet tunx {
     $inbound_skb
   }
   $forward_chain
+  # Inbound TCP connections already open when the table is loaded, such as the
+  # SSH session running the install. Conntrack may have picked them up mid-way
+  # with this host as the opener, so the pre chain cannot tell; without this
+  # their replies would be sent into the TUN and reset.
+  set open4 {
+    type ipv4_addr . inet_service . ipv4_addr . inet_service
+    \$e4
+  }
+  set open6 {
+    type ipv6_addr . inet_service . ipv6_addr . inet_service
+    \$e6
+  }
   chain route {
     type route hook output priority mangle; policy accept;
+    ip saddr . tcp sport . ip daddr . tcp dport @open4 ct mark set $MARK_INBOUND
+    ip6 saddr . tcp sport . ip6 daddr . tcp dport @open6 ct mark set $MARK_INBOUND
     ct mark $MARK_INBOUND meta mark set $MARK_INBOUND
   }
   chain out {

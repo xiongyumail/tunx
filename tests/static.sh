@@ -28,11 +28,43 @@ for mode in host wsl gateway; do
     # exists only on an installed system.
     shellcheck -S warning -e SC1091 "$NET_SCRIPT"
 
-    # The ruleset exactly as firewall_up loads it, with the runtime values filled in.
-    # shellcheck disable=SC2016 # the names are matched literally
-    sed -n '/^firewall_up() {$/,/^NFT$/p' "$NET_SCRIPT" | sed '1,2d;$d' |
-        sed 's/\$TUN_NAME/tunx0/g; s/\$XRAY_UID/999/g' >"$tmp/fw-$mode.nft"
-    nft -c -f "$tmp/fw-$mode.nft"
+    # Run firewall_up from the generated script with nft captured, once with no
+    # open connections and once with a stubbed ss listing some.
+    sed -n '/^open_inbound() {$/,/^NFT$/p' "$NET_SCRIPT" >"$tmp/fw-funcs"
+    echo "}" >>"$tmp/fw-funcs"
+    for conns in none some; do
+        (
+            # Read by the sourced firewall_up.
+            # shellcheck disable=SC2034
+            TUN_NAME=tunx0 XRAY_UID=999 fams="-4 -6"
+            # nft and ss are called by the sourced functions.
+            # shellcheck disable=SC2317,SC2329
+            nft() { cat >"$tmp/fw-$mode-$conns.nft"; }
+            # shellcheck disable=SC2317,SC2329
+            if [ "$conns" = some ]; then
+                ss() {
+                    case "$*" in
+                        -Htln) printf '%s\n' 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*' 'LISTEN 0 128 [::]:22 [::]:*' ;;
+                        "-Htn4 state established")
+                            printf '%s\n' '0 0 10.99.0.12:22 10.99.0.1:50432' '0 0 10.99.0.12:40000 1.1.1.1:443' ;;
+                        "-Htn6 state established") printf '%s\n' '0 0 [fe80::1%ens3]:22 [fe80::2%ens3]:51000' ;;
+                    esac
+                }
+            else
+                ss() { :; }
+            fi
+            # shellcheck source=/dev/null
+            . "$tmp/fw-funcs"
+            firewall_up
+        )
+        nft -c -f "$tmp/fw-$mode-$conns.nft"
+    done
+    if ! grep -q '10.99.0.12 . 22 . 10.99.0.1 . 50432' "$tmp/fw-$mode-some.nft" ||
+        ! grep -q 'fe80::1 . 22 . fe80::2 . 51000' "$tmp/fw-$mode-some.nft" ||
+        grep -q 40000 "$tmp/fw-$mode-some.nft"; then
+        echo "FAIL: open inbound connections not listed as expected"; exit 1
+    fi
+    cp "$tmp/fw-$mode-none.nft" "$tmp/fw-$mode.nft"
 
     has() { grep -q -- "$1" "$tmp/fw-$mode.nft"; }
     if [ "$mode" = gateway ]; then
