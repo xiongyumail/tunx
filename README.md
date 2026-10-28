@@ -127,6 +127,13 @@ Examples:
 - Whether IPv6 reaches the internet depends on the upstream's exit. If it has no IPv6, IPv6 connections fail and programs fall back to IPv4; nothing leaves directly either way.
 - Xray's TUN inbound is a fairly new feature; verify on your machine before changing versions.
 
+## Tests
+
+- `sudo tests/static.sh`: shell syntax and ShellCheck, and the generated policy script and nftables ruleset for the normal, WSL and gateway modes (`nft -c`, nothing is loaded).
+- `tests/config.sh`: downloads Xray into a temp dir, checks the examples and the starter config, and checks that broken configs are rejected.
+
+Both run in GitHub Actions on every push.
+
 ## License
 
 MIT

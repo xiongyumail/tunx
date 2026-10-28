@@ -870,4 +870,5 @@ main() {
     esac
 }
 
-main "$@"
+# Tests source this file for its functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
