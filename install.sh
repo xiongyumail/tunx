@@ -132,7 +132,7 @@ install_xray() {
         local want got
         want=$(awk -F'= ' 'toupper($1)=="SHA2-256" {print $2}' "$tmp/xray.dgst" | head -1)
         got=$(sha256sum "$tmp/xray.zip" | awk '{print $1}')
-        [ -n "$want" ] && [ "$want" = "$got" ] || die "SHA-256 mismatch (want $want, got $got)"
+        if [ -z "$want" ] || [ "$want" != "$got" ]; then die "SHA-256 mismatch (want $want, got $got)"; fi
         log "SHA-256 verified"
         zip="$tmp/xray.zip"
     fi
