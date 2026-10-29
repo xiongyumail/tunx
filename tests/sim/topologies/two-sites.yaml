@@ -1,0 +1,106 @@
+# Reference topology: two sites, a hub, a remote exit and a phone on the internet.
+#
+#                         internet 203.0.113.0/24, 2001:db8:113::/64
+#   hub .10   exit .20   phone .30   web .80   router-a .11   carrier .12
+#                                                  |               |  firewall: from mob0 only
+#                                           lan-a 10.0.1.0/24      |  TCP 443/4430 to hub, NAT
+#                                           gw-a .2  term-a .10    |
+#                                                         mobile 100.64.0.0/24 (netem)
+#                                                                  |
+#                                                            router-b .2 (NAT)
+#                                                                  |
+#                                                         lan-b 10.0.2.0/24
+#                                                         gw-b .2  host-b .10
+#
+# Site routers send the remote site prefix to their local gateway node; the
+# overlay is expected to carry it. Without the overlay that traffic loops
+# between router and gateway until its TTL expires.
+
+name: two-sites
+prefix: ts
+
+vars:
+  mobile_delay: 40ms   # one-way, applied in each direction (RTT about 2x)
+  mobile_loss: 0%      # per direction; CI runs 0%, 1% and 3%
+
+segments:
+  internet:
+    subnet: [203.0.113.0/24, 2001:db8:113::/64]
+  mobile:
+    subnet: 100.64.0.0/24
+    netem: {delay: "${mobile_delay}", loss: "${mobile_loss}"}
+  lan-a:
+    subnet: 10.0.1.0/24
+  lan-b:
+    subnet: 10.0.2.0/24
+
+nodes:
+  hub:
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.10, "2001:db8:113::10"]}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 443,8080 --udp 443
+
+  exit:
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.20, "2001:db8:113::20"]}
+
+  phone:
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.30, "2001:db8:113::30"]}
+
+  # A public server, used as a destination for internet (egress) traffic.
+  web:
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.80, "2001:db8:113::80"]}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 80,443 --udp 53
+
+  # Site A: home router with NAT, a gateway node and a terminal on the LAN.
+  router-a:
+    forward: true
+    interfaces:
+      wan0: {segment: internet, addr: [203.0.113.11, "2001:db8:113::11"], nat: masquerade}
+      lan0: {segment: lan-a, addr: 10.0.1.1}
+    routes:
+      - 10.0.2.0/24 via 10.0.1.2     # site B, through the overlay on gw-a
+
+  gw-a:
+    interfaces:
+      eth0: {segment: lan-a, addr: 10.0.1.2, gateway: 10.0.1.1}
+
+  term-a:
+    interfaces:
+      eth0: {segment: lan-a, addr: 10.0.1.10, gateway: 10.0.1.1}
+
+  # Mobile carrier between site B and the internet: carrier-grade NAT and a
+  # censor that lets through only TCP 443/4430 to the hub.
+  carrier:
+    forward: true
+    interfaces:
+      wan0: {segment: internet, addr: 203.0.113.12, nat: masquerade}
+      mob0: {segment: mobile, addr: 100.64.0.1}
+    firewall:
+      - iif: mob0
+        allow:
+          - {proto: tcp, to: "${hub.eth0}", ports: [443, 4430]}
+        default: drop
+
+  # Site B: router with NAT whose only uplink is the mobile segment.
+  router-b:
+    forward: true
+    interfaces:
+      wan0: {segment: mobile, addr: 100.64.0.2, gateway: 100.64.0.1, nat: masquerade}
+      lan0: {segment: lan-b, addr: 10.0.2.1}
+    routes:
+      - 10.0.1.0/24 via 10.0.2.2     # site A, through the overlay on gw-b
+
+  gw-b:
+    interfaces:
+      eth0: {segment: lan-b, addr: 10.0.2.2, gateway: 10.0.2.1}
+
+  host-b:
+    interfaces:
+      eth0: {segment: lan-b, addr: 10.0.2.10, gateway: 10.0.2.1}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 22,80 --udp 53

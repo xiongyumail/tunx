@@ -1,0 +1,129 @@
+# Plain IP checks on two-sites.yaml (no overlay daemon): every segment works,
+# NAT rewrites sources, the censor passes only TCP 443/4430 to the hub, the
+# mobile segment adds delay, netem and link cuts can be changed at runtime.
+#
+#   sim.py run topologies/two-sites.yaml scenarios/smoke.yaml --set mobile_loss=1%
+
+name: smoke
+
+vars:
+  probe: python3 ${sim}/probe.py
+
+steps:
+  # Servers come up in the background with the topology.
+  - name: hub probe server is listening
+    wait_until: ${probe} tcp 127.0.0.1 443 --timeout 1
+    node: hub
+    timeout: 15
+  - name: host-b probe server is listening
+    wait_until: ${probe} tcp 127.0.0.1 22 --timeout 1
+    node: host-b
+    timeout: 15
+
+  # Site A.
+  - name: term-a reaches its router
+    exec: ping -c 2 -W 1 -i 0.2 ${router-a.lan0}
+    node: term-a
+  - name: term-a reaches the hub through NAT
+    exec: ${probe} tcp ${hub.eth0} 443
+    node: term-a
+    match: '^peer ${router-a.wan0} '
+  - name: router-a sends site B's prefix to gw-a
+    exec: ip route get ${host-b.eth0}
+    node: router-a
+    match: 'via ${gw-a.eth0} dev lan0'
+
+  # Internet, including IPv6.
+  - name: phone reaches the hub over IPv4
+    exec: ping -c 2 -W 1 -i 0.2 ${hub.eth0}
+    node: phone
+  - name: phone reaches the hub over IPv6
+    exec: ping -c 2 -W 1 -i 0.2 ${hub.eth0.v6}
+    node: phone
+  - name: exit reaches web over UDP
+    exec: ${probe} udp ${web.eth0} 53
+    node: exit
+    match: '^peer ${exit.eth0} '
+
+  # Site B over the mobile uplink and the censor.
+  - name: host-b reaches its router
+    exec: ping -c 2 -W 1 -i 0.2 ${router-b.lan0}
+    node: host-b
+  - name: gw-b reaches the hub on TCP 443 (seen as the carrier)
+    exec: ${probe} tcp ${hub.eth0} 443
+    node: gw-b
+    match: '^peer ${carrier.wan0} '
+  - name: censor drops TCP to other ports
+    exec: ${probe} tcp ${hub.eth0} 8080 --timeout 2
+    node: gw-b
+    rc: nonzero
+  - name: censor drops UDP
+    exec: ${probe} udp ${hub.eth0} 443 --timeout 2
+    node: gw-b
+    rc: nonzero
+  - name: censor drops ping
+    exec: ping -c 2 -W 1 ${hub.eth0}
+    node: gw-b
+    rc: nonzero
+  - name: censor drops TCP 443 to other hosts
+    exec: ${probe} tcp ${web.eth0} 443 --timeout 2
+    node: gw-b
+    rc: nonzero
+
+  # Measurements.
+  - name: latency mobile
+    measure: ping
+    from: router-b
+    to: ${carrier.mob0}
+    count: 20
+    expect: {avg_rtt_min_ms: 75}
+  - name: throughput lan-a to hub
+    measure: iperf3
+    from: term-a
+    server: hub
+    port: 5201
+    duration: 3
+    continue: true
+  - name: throughput site-b to hub over mobile
+    measure: iperf3
+    from: gw-b
+    server: hub
+    port: 4430
+    duration: 5
+    continue: true
+  - name: throughput hub to site-b over mobile (reverse)
+    measure: iperf3
+    from: gw-b
+    server: hub
+    port: 4430
+    duration: 5
+    reverse: true
+    continue: true
+
+  # Runtime netem.
+  - netem: {loss: 3%}
+    segment: mobile
+  - name: latency mobile at 3% loss
+    measure: ping
+    from: router-b
+    to: ${carrier.mob0}
+    count: 50
+    continue: true
+  - netem: reset
+    segment: mobile
+
+  # Cut site B's uplink and restore it.
+  - link: down
+    node: router-b
+    if: wan0
+  - name: site B is cut off
+    exec: ${probe} tcp ${hub.eth0} 443 --timeout 2
+    node: gw-b
+    rc: nonzero
+  - link: up
+    node: router-b
+    if: wan0
+  - name: site B is back
+    wait_until: ${probe} tcp ${hub.eth0} 443 --timeout 2
+    node: gw-b
+    timeout: 20
