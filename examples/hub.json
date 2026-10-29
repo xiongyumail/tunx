@@ -1,0 +1,50 @@
+// Hub of the three-node example: a public node that both site gateways dial.
+// It relays between the sites and can reach both LANs itself.
+//
+// Overlay 10.200.0.0/24 and fd74:756e:7800::/64; site A LAN 10.0.1.0/24,
+// site B LAN 10.0.2.0/24. The keys are examples: generate your own with
+// `tunxd keygen`.
+{
+  "node": "hub",
+  "network": "example",
+  "private_key": "5DXuZRWfe0naqzrctvsuzl5lABqlnWfLtQBZSkxQp7Y=",
+  "addresses": ["10.200.0.1", "fd74:756e:7800::1"],
+
+  "tun": {
+    "name": "tunx0",
+    "mtu": 1400,
+    "addresses": ["10.200.0.1/24", "fd74:756e:7800::1/64"],
+    "capture": ["10.0.1.0/24", "10.0.2.0/24"]
+  },
+
+  // The local Xray inbound (VLESS + Reality) forwards link connections here.
+  "listen": [{"address": "127.0.0.1:7700"}],
+
+  "peers": [
+    {"name": "site-a", "public_key": "RC6GLc35UndsjWjZJlmzwS+XdFlfUCHPR1sslB0XWc4="},
+    {"name": "site-b", "public_key": "S2CjiEuGijAwFiGcYrzGJ/cywOImURFiKansnh3Xbyw="}
+  ],
+
+  "routes": [
+    {"prefix": "10.0.1.0/24", "advertisers": [{"node": "site-a"}]},
+    {"prefix": "10.0.2.0/24", "advertisers": [{"node": "site-b"}]},
+    {"prefix": "10.200.0.2/32", "advertisers": [{"node": "site-a"}]},
+    {"prefix": "10.200.0.3/32", "advertisers": [{"node": "site-b"}]},
+    {"prefix": "fd74:756e:7800::2/128", "advertisers": [{"node": "site-a"}]},
+    {"prefix": "fd74:756e:7800::3/128", "advertisers": [{"node": "site-b"}]}
+  ],
+
+  "groups": {"sites": ["site-a", "site-b"]},
+
+  // Checked for flows entering here (from the TUN) and for flows delivered
+  // here (to the hub's own overlay addresses). Relayed flows are not checked
+  // here; the delivering site checks them.
+  "policy": [
+    {"action": "allow", "identity": ["hub"]},
+    {"action": "allow", "identity": ["@sites"], "dst": ["10.200.0.1/32"], "proto": ["icmp"]},
+    {"action": "allow", "identity": ["@sites"], "dst": ["10.200.0.1/32"], "proto": ["tcp"], "ports": [22, 443]}
+  ],
+
+  "status": "127.0.0.1:7790",
+  "log_level": "info"
+}

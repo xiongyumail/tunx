@@ -1,0 +1,43 @@
+// Gateway of site B (LAN 10.0.2.0/24), behind carrier NAT. It dials the hub
+// through the local Xray outbound; site A reaches it over that session.
+{
+  "node": "site-b",
+  "network": "example",
+  "private_key": "Hwj0aqwb1yKmGouQ9E/GKtZr02s6j5/TAn2lvKikblY=",
+  "addresses": ["10.200.0.3", "fd74:756e:7800::3"],
+
+  "tun": {
+    "name": "tunx0",
+    "mtu": 1400,
+    "addresses": ["10.200.0.3/24", "fd74:756e:7800::3/64"],
+    "capture": ["10.0.1.0/24"]
+  },
+
+  "peers": [
+    {
+      "name": "hub",
+      "public_key": "Tlsnm/UmIl4hNQhD2zypl+u/JdYC0RotgT7JvUKQxpc=",
+      "dial": "127.0.0.1:10800",
+      "relay_for": ["site-a"]
+    }
+  ],
+
+  "routes": [
+    // Delivered from this gateway's own address: the site needs no route
+    // back.
+    {"prefix": "10.0.2.0/24", "advertisers": [{"node": "site-b", "source": "snat"}]},
+    {"prefix": "10.0.1.0/24", "advertisers": [{"node": "site-a", "via": ["hub"]}]},
+    {"prefix": "10.200.0.0/24", "advertisers": [{"node": "hub"}]},
+    {"prefix": "fd74:756e:7800::/64", "advertisers": [{"node": "hub"}]}
+  ],
+
+  "policy": [
+    {"action": "allow", "identity": ["site-b"]},
+    {"action": "allow", "identity": ["site-a"], "dst": ["10.0.2.0/24"]},
+    {"action": "allow", "identity": ["hub"], "dst": ["10.0.2.0/24", "10.200.0.3/32"], "proto": ["icmp"]}
+  ],
+
+  "status": "127.0.0.1:7790",
+  "hop_limit": 4,
+  "link": {"keepalive_interval": "5s", "keepalive_timeout": "15s"}
+}

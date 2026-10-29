@@ -1,0 +1,48 @@
+// Gateway of site A (LAN 10.0.1.0/24). It dials the hub through the local
+// Xray outbound and reaches site B through the hub.
+{
+  "node": "site-a",
+  "network": "example",
+  "private_key": "x7z8uLwZbu17vYSEK/BYfG+nvTDZ2bMMgn0jZ+kBehQ=",
+  "addresses": ["10.200.0.2", "fd74:756e:7800::2"],
+
+  // The site router sends 10.0.2.0/24 to this gateway; the gateway routes it
+  // into the TUN (see `tunxd check`).
+  "tun": {
+    "name": "tunx0",
+    "mtu": 1400,
+    "addresses": ["10.200.0.2/24", "fd74:756e:7800::2/64"],
+    "capture": ["10.0.2.0/24"]
+  },
+
+  "peers": [
+    {
+      "name": "hub",
+      "public_key": "Tlsnm/UmIl4hNQhD2zypl+u/JdYC0RotgT7JvUKQxpc=",
+      // Local Xray inbound (dokodemo-door) whose outbound is VLESS + Reality
+      // to the hub's public address.
+      "dial": "127.0.0.1:10800",
+      // The hub relays flows from site B and its own.
+      "relay_for": ["site-b"]
+    }
+  ],
+
+  "routes": [
+    // Delivered here with the original source address; the site router
+    // routes 10.200.0.0/24 and 10.0.2.0/24 back to this gateway.
+    {"prefix": "10.0.1.0/24", "advertisers": [{"node": "site-a", "source": "preserve"}]},
+    {"prefix": "10.0.2.0/24", "advertisers": [{"node": "site-b", "via": ["hub"]}]},
+    {"prefix": "10.200.0.0/24", "advertisers": [{"node": "hub"}]},
+    {"prefix": "fd74:756e:7800::/64", "advertisers": [{"node": "hub"}]}
+  ],
+
+  "policy": [
+    // Own traffic into the overlay.
+    {"action": "allow", "identity": ["site-a"]},
+    // Who may reach this LAN and this gateway.
+    {"action": "allow", "identity": ["hub", "site-b"], "dst": ["10.0.1.0/24", "10.200.0.2/32"], "proto": ["tcp", "udp", "icmp"]},
+    {"action": "deny"}
+  ],
+
+  "status": "127.0.0.1:7790"
+}
