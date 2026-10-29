@@ -1,0 +1,418 @@
+package link
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/xiongyumail/tunx/internal/core"
+	"github.com/xtaci/smux"
+)
+
+// Control message types. Types below MinControlType belong to this package.
+const (
+	ctrlPing uint8 = 1
+	ctrlPong uint8 = 2
+
+	// MinControlType is the lowest type available to SendControl.
+	MinControlType uint8 = 0x10
+)
+
+// Session is an authenticated, multiplexed link to one peer. Either side
+// opens flows with OpenFlow; flows the peer opens wait until Serve takes them.
+type Session struct {
+	cfg    Config
+	peer   string
+	client bool
+	mux    *smux.Session
+	start  time.Time
+
+	incoming chan inbound
+
+	ctrlOnce  sync.Once
+	ctrlReady chan struct{}
+	ctrl      *smux.Stream
+	ctrlMu    sync.Mutex // serializes control writes
+
+	lastPong atomic.Int64 // nanoseconds since start
+	srtt     atomic.Int64 // smoothed RTT, nanoseconds
+	pinging  atomic.Bool
+
+	closeOnce sync.Once
+	done      chan struct{}
+	err       error
+}
+
+type inbound struct {
+	meta core.FlowMeta
+	flow core.Flow
+}
+
+// Client runs the handshake as the dialing side and starts the session. On
+// error conn is closed. ctx bounds only the handshake.
+func Client(ctx context.Context, conn net.Conn, cfg Config) (*Session, error) {
+	return handshake(ctx, conn, cfg, true)
+}
+
+// Server runs the handshake as the accepting side and starts the session. On
+// error conn is closed. ctx bounds only the handshake.
+func Server(ctx context.Context, conn net.Conn, cfg Config) (*Session, error) {
+	return handshake(ctx, conn, cfg, false)
+}
+
+func handshake(ctx context.Context, conn net.Conn, cfg Config, client bool) (*Session, error) {
+	cfg = cfg.withDefaults()
+	if err := cfg.validate(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	deadline := time.Now().Add(cfg.HandshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	conn.SetDeadline(deadline)
+	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Unix(1, 0)) })
+
+	var peer string
+	var err error
+	if client {
+		peer, _, err = clientHandshake(conn, &cfg)
+	} else {
+		peer, _, err = serverHandshake(conn, &cfg)
+	}
+	if !stop() && err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		conn.Close()
+		if ctx.Err() != nil {
+			err = fmt.Errorf("%w (%v)", ctx.Err(), err)
+		}
+		return nil, fmt.Errorf("link: handshake with %s: %w", conn.RemoteAddr(), err)
+	}
+	conn.SetDeadline(time.Time{})
+
+	s, err := newSession(conn, cfg, peer, client)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	cfg.Logger.Info("link session up", "peer", peer, "client", client)
+	return s, nil
+}
+
+func newSession(conn net.Conn, cfg Config, peer string, client bool) (*Session, error) {
+	mc := &smux.Config{
+		Version:           2,
+		KeepAliveDisabled: true,
+		MaxFrameSize:      muxFrameSize,
+		MaxReceiveBuffer:  cfg.MaxReceiveBuffer,
+		MaxStreamBuffer:   cfg.MaxStreamBuffer,
+	}
+	var mux *smux.Session
+	var err error
+	if client {
+		mux, err = smux.Client(conn, mc)
+	} else {
+		mux, err = smux.Server(conn, mc)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s := &Session{
+		cfg:       cfg,
+		peer:      peer,
+		client:    client,
+		mux:       mux,
+		start:     time.Now(),
+		incoming:  make(chan inbound),
+		ctrlReady: make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+	if client {
+		// The dialing side opens the control stream first.
+		st, err := mux.OpenStream()
+		if err == nil {
+			_, err = st.Write(encodeHeader(streamControl, nil))
+		}
+		if err != nil {
+			mux.Close()
+			return nil, err
+		}
+		s.setControl(st)
+	}
+	go s.acceptLoop()
+	go s.keepalive()
+	go func() {
+		select {
+		case <-mux.CloseChan():
+			s.closeWith(ErrClosed)
+		case <-s.done:
+		}
+	}()
+	return s, nil
+}
+
+// Peer returns the authenticated name of the node on the other end.
+func (s *Session) Peer() string { return s.peer }
+
+// RTT returns the smoothed round-trip time of keepalive pings, or 0 before
+// the first pong.
+func (s *Session) RTT() time.Duration { return time.Duration(s.srtt.Load()) }
+
+// Done is closed when the session ends.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// Err returns why the session ended, or nil while it is up.
+func (s *Session) Err() error {
+	select {
+	case <-s.done:
+		return s.err
+	default:
+		return nil
+	}
+}
+
+// Close ends the session and closes the underlying connection.
+func (s *Session) Close() error {
+	s.closeWith(ErrClosed)
+	return nil
+}
+
+func (s *Session) closeWith(err error) {
+	s.closeOnce.Do(func() {
+		s.err = err
+		close(s.done)
+		s.mux.Close()
+		s.cfg.Logger.Info("link session down", "peer", s.peer, "err", err)
+	})
+}
+
+// OpenFlow opens a flow to the peer. A deadline on ctx bounds sending the
+// stream header.
+func (s *Session) OpenFlow(ctx context.Context, meta core.FlowMeta) (core.Flow, error) {
+	body, err := encodeFlowMeta(meta)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	st, err := s.mux.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		st.SetWriteDeadline(d)
+	}
+	if _, err := st.Write(encodeHeader(streamFlow, body)); err != nil {
+		st.Close()
+		return nil, err
+	}
+	st.SetWriteDeadline(time.Time{})
+	return newFlow(st, meta.Proto), nil
+}
+
+// Serve hands flows opened by the peer to h, each in its own goroutine, with
+// Ingress{Kind: "link", Peer: s.Peer()}. The context passed to h is canceled
+// when ctx is or the session ends. Serve returns when either happens.
+func (s *Session) Serve(ctx context.Context, h core.Handler) error {
+	hctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-s.done:
+			cancel()
+		case <-hctx.Done():
+		}
+	}()
+	in := core.Ingress{Kind: "link", Peer: s.peer}
+	for {
+		select {
+		case f := <-s.incoming:
+			go h.HandleFlow(hctx, f.meta, f.flow, in)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.done:
+			return s.err
+		}
+	}
+}
+
+func (s *Session) acceptLoop() {
+	for {
+		st, err := s.mux.AcceptStream()
+		if err != nil {
+			s.closeWith(ErrClosed)
+			return
+		}
+		go s.handleStream(st)
+	}
+}
+
+func (s *Session) handleStream(st *smux.Stream) {
+	st.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
+	typ, body, err := readHeader(st)
+	st.SetReadDeadline(time.Time{})
+	if err != nil {
+		s.cfg.Logger.Debug("link: bad stream header", "peer", s.peer, "err", err)
+		st.Close()
+		return
+	}
+	switch typ {
+	case streamControl:
+		if s.client || !s.setControl(st) {
+			st.Close()
+		}
+	case streamFlow:
+		meta, err := parseFlowMeta(body)
+		if err != nil {
+			st.Close()
+			return
+		}
+		f := newFlow(st, meta.Proto)
+		select {
+		case s.incoming <- inbound{meta: meta, flow: f}:
+		case <-s.done:
+			f.Close()
+		}
+	default:
+		st.Close()
+	}
+}
+
+// setControl installs the control stream once and starts its reader.
+func (s *Session) setControl(st *smux.Stream) bool {
+	ok := false
+	s.ctrlOnce.Do(func() {
+		s.ctrl = st
+		close(s.ctrlReady)
+		go s.controlLoop(st)
+		ok = true
+	})
+	return ok
+}
+
+// Control message: type (1), payload length (4), payload.
+func (s *Session) controlLoop(st *smux.Stream) {
+	var h [5]byte
+	for {
+		if _, err := io.ReadFull(st, h[:]); err != nil {
+			s.closeWith(fmt.Errorf("%w: control stream: %v", ErrClosed, err))
+			return
+		}
+		n := binary.BigEndian.Uint32(h[1:])
+		if n > MaxControlLen {
+			s.closeWith(fmt.Errorf("%w: control message too large", ErrProtocol))
+			return
+		}
+		payload := make([]byte, n)
+		if _, err := io.ReadFull(st, payload); err != nil {
+			s.closeWith(fmt.Errorf("%w: control stream: %v", ErrClosed, err))
+			return
+		}
+		switch typ := h[0]; {
+		case typ == ctrlPing:
+			s.writeControl(time.Now().Add(s.cfg.KeepaliveTimeout), ctrlPong, payload)
+		case typ == ctrlPong:
+			s.onPong(payload)
+		case typ >= MinControlType && s.cfg.OnControl != nil:
+			s.cfg.OnControl(s, typ, payload)
+		}
+	}
+}
+
+// SendControl sends an application control message to the peer. typ must be
+// at least MinControlType. A deadline on ctx bounds the write.
+func (s *Session) SendControl(ctx context.Context, typ uint8, payload []byte) error {
+	if typ < MinControlType {
+		return fmt.Errorf("link: control type %#x is reserved", typ)
+	}
+	if len(payload) > MaxControlLen {
+		return ErrMessageTooLarge
+	}
+	select {
+	case <-s.ctrlReady:
+	case <-s.done:
+		return s.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	d, _ := ctx.Deadline()
+	return s.writeControl(d, typ, payload)
+}
+
+func (s *Session) writeControl(deadline time.Time, typ uint8, payload []byte) error {
+	b := make([]byte, 5, 5+len(payload))
+	b[0] = typ
+	binary.BigEndian.PutUint32(b[1:], uint32(len(payload)))
+	b = append(b, payload...)
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	s.ctrl.SetWriteDeadline(deadline)
+	_, err := s.ctrl.Write(b)
+	s.ctrl.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (s *Session) since() int64 { return int64(time.Since(s.start)) }
+
+func (s *Session) onPong(payload []byte) {
+	if len(payload) != 8 {
+		return
+	}
+	now := s.since()
+	sent := int64(binary.BigEndian.Uint64(payload))
+	if sent < 0 || sent > now {
+		return
+	}
+	s.lastPong.Store(now)
+	rtt := now - sent
+	if old := s.srtt.Load(); old != 0 {
+		rtt = (7*old + rtt) / 8
+	}
+	s.srtt.Store(rtt)
+}
+
+// keepalive pings the peer and closes the session when pongs stop.
+func (s *Session) keepalive() {
+	ping := time.NewTicker(s.cfg.KeepaliveInterval)
+	defer ping.Stop()
+	check := time.NewTicker(max(s.cfg.KeepaliveTimeout/8, time.Millisecond))
+	defer check.Stop()
+	timeout := int64(s.cfg.KeepaliveTimeout)
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-check.C:
+			if s.since()-s.lastPong.Load() > timeout {
+				s.closeWith(ErrKeepalive)
+				return
+			}
+		case <-ping.C:
+			select {
+			case <-s.ctrlReady:
+			default:
+				continue
+			}
+			if s.pinging.Swap(true) {
+				continue // the previous ping is still blocked
+			}
+			go func() {
+				defer s.pinging.Store(false)
+				var b [8]byte
+				binary.BigEndian.PutUint64(b[:], uint64(s.since()))
+				s.writeControl(time.Now().Add(s.cfg.KeepaliveTimeout), ctrlPing, b[:])
+			}()
+		}
+	}
+}
