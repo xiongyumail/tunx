@@ -3,8 +3,8 @@
 `tunx-hub` is the controller. It keeps the whole network in SQLite, serves a
 REST API, and renders for every node its tunxd config and its Xray config.
 Nodes keep the last config they pulled, so the network keeps working while
-the hub is down. This version has no web panel yet and does not push
-configs; nodes pull them.
+the hub is down. `serve` also serves the web panel. This version does not
+push configs; nodes pull them.
 
 ## Commands
 
@@ -215,6 +215,49 @@ The bundle:
   "warnings": ["link \"b-hub\": node \"site-b\" is not enrolled; link skipped"]
 }
 ```
+
+## Web panel
+
+`tunx-hub serve` serves the panel at `/` and the API at `/api/`. The panel
+is a Vue 3 + Ant Design Vue single-page app in `web/`, built into
+`internal/hub/webui/dist` and embedded with `go:embed`, so `go build` needs
+no Node. Paths that are not files return `index.html` (client routing);
+hashed files under `/assets/` are cached for a year, everything else is
+`no-cache`. Every panel response has a CSP that allows only same-origin
+scripts (no inline scripts; inline styles for Ant Design's CSS-in-JS),
+`frame-ancestors 'none'`, `nosniff` and `no-referrer`.
+
+Pages: login (password + TOTP), overview (topology from the configured
+links, counts, render warnings of every node), nodes (endpoints with their
+transport stack, proxies, enrolment token and install command, rendered
+config), links, routes and exits, access and egress policies (ordered, move
+up and down), clients (share link, QR code, Base64 subscription), groups,
+YAML import and export (editor, line diff against the hub before import),
+audit log, settings (network, API tokens, language, theme). The panel is in
+Chinese and English (default from the browser) with light and dark themes.
+
+Rebuild after changing `web/`, and commit `internal/hub/webui/dist`:
+
+```
+cd web
+npm ci
+npm run build          # writes ../internal/hub/webui/dist
+npm run dev            # dev server on 127.0.0.1:5173, proxies /api to :8780
+npm test               # smoke test, see below
+```
+
+`npm test` (`web/tests/smoke.mjs`) builds tunx-hub, seeds a temporary
+database from `examples/network.yaml`, serves it on 127.0.0.1, signs in
+through the panel and visits every page at 375 px and 1440 px. It fails on
+console errors, failed API calls or horizontal scroll. With `SHOTS=DIR` it
+also saves screenshots of every page in both themes (`SHOT_LANGS=zh,en`).
+It uses `playwright-core` with Chromium (`npx playwright-core install
+chromium`).
+
+Not yet in the API, so not in the panel: node status (online, RTT,
+traffic), changing the admin password or TOTP secret, a subscription URL
+served by the hub, and a dry-run import that returns the object changes
+(the preview is a text diff).
 
 ## Example network
 

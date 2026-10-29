@@ -24,6 +24,7 @@ import (
 	"github.com/xiongyumail/tunx/internal/hub/model"
 	"github.com/xiongyumail/tunx/internal/hub/render"
 	"github.com/xiongyumail/tunx/internal/hub/store"
+	"github.com/xiongyumail/tunx/internal/hub/webui"
 )
 
 const usage = `usage: tunx-hub <command> [flags] [args]
@@ -34,7 +35,7 @@ commands:
                          (password from the file or the first line of stdin);
                          prints the TOTP secret once
   serve [-listen ADDR] [-tls-cert FILE -tls-key FILE] [-insecure-cookie]
-                         serve the API (default 127.0.0.1:8780)
+                         serve the API and the web panel (default 127.0.0.1:8780)
   render NODE            print the rendered configs of a node (JSON)
   import FILE            replace the network with a YAML file ("-": stdin)
   export FILE            write the network as YAML ("-": stdout)
@@ -171,7 +172,7 @@ func cmdServe(path, listen, cert, key string, insecure bool, stderr io.Writer) e
 	}
 	return withStore(path, func(st *store.Store) error {
 		srv := &api.Server{Store: st, Log: log, SecureCookie: !insecure}
-		hs := &http.Server{Addr: listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		hs := &http.Server{Addr: listen, Handler: webui.Mount(srv.Handler()), ReadHeaderTimeout: 10 * time.Second}
 		ln, err := net.Listen("tcp", listen)
 		if err != nil {
 			return err
