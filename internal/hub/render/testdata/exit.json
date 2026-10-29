@@ -1,0 +1,289 @@
+{
+  "node": "exit",
+  "revision": "73cc8f8390739ddb1ca5b751",
+  "tunxd": {
+    "node": "exit",
+    "network": "example",
+    "private_key_file": "node.key",
+    "addresses": [
+      "10.200.0.4",
+      "fd74:756e:7800::4"
+    ],
+    "listen": [
+      {
+        "address": "127.0.0.1:7700"
+      }
+    ],
+    "peers": [
+      {
+        "name": "hub",
+        "public_key": "Tlsnm/UmIl4hNQhD2zypl+u/JdYC0RotgT7JvUKQxpc=",
+        "relay_for": [
+          "phone",
+          "site-a",
+          "site-b"
+        ]
+      }
+    ],
+    "routes": [
+      {
+        "prefix": "0.0.0.0/0",
+        "advertisers": [
+          {
+            "node": "exit"
+          }
+        ]
+      },
+      {
+        "prefix": "10.0.1.0/24",
+        "advertisers": [
+          {
+            "node": "site-a",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      },
+      {
+        "prefix": "10.0.2.0/24",
+        "advertisers": [
+          {
+            "node": "site-b",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      },
+      {
+        "prefix": "10.200.0.1/32",
+        "advertisers": [
+          {
+            "node": "hub"
+          }
+        ]
+      },
+      {
+        "prefix": "10.200.0.2/32",
+        "advertisers": [
+          {
+            "node": "site-a",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      },
+      {
+        "prefix": "10.200.0.3/32",
+        "advertisers": [
+          {
+            "node": "site-b",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      },
+      {
+        "prefix": "::/0",
+        "advertisers": [
+          {
+            "node": "exit"
+          }
+        ]
+      },
+      {
+        "prefix": "fd74:756e:7800::1/128",
+        "advertisers": [
+          {
+            "node": "hub"
+          }
+        ]
+      },
+      {
+        "prefix": "fd74:756e:7800::2/128",
+        "advertisers": [
+          {
+            "node": "site-a",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      },
+      {
+        "prefix": "fd74:756e:7800::3/128",
+        "advertisers": [
+          {
+            "node": "site-b",
+            "via": [
+              "hub"
+            ]
+          }
+        ]
+      }
+    ],
+    "groups": {
+      "sites": [
+        "site-a",
+        "site-b"
+      ]
+    },
+    "policy": [
+      {
+        "action": "allow",
+        "identity": [
+          "hub"
+        ]
+      },
+      {
+        "action": "allow",
+        "identity": [
+          "site-a"
+        ],
+        "dst": [
+          "10.0.2.0/24",
+          "10.200.0.3/32",
+          "fd74:756e:7800::3/128"
+        ],
+        "proto": [
+          "tcp",
+          "udp",
+          "icmp"
+        ]
+      },
+      {
+        "action": "allow",
+        "identity": [
+          "site-b"
+        ],
+        "dst": [
+          "10.0.1.0/24"
+        ],
+        "proto": [
+          "tcp"
+        ],
+        "ports": [
+          "22"
+        ]
+      },
+      {
+        "action": "allow",
+        "identity": [
+          "phone"
+        ],
+        "dst": [
+          "10.0.1.0/24",
+          "10.0.2.0/24"
+        ]
+      },
+      {
+        "action": "allow",
+        "identity": [
+          "@sites",
+          "phone"
+        ],
+        "dst": [
+          "10.200.0.1/32",
+          "fd74:756e:7800::1/128"
+        ],
+        "proto": [
+          "icmp"
+        ]
+      },
+      {
+        "action": "deny",
+        "dst": [
+          "10.0.0.0/8",
+          "10.200.0.0/24",
+          "fd74:756e:7800::/64"
+        ]
+      },
+      {
+        "action": "allow",
+        "identity": [
+          "@sites",
+          "phone"
+        ]
+      }
+    ]
+  },
+  "xray": {
+    "inbounds": [
+      {
+        "listen": "0.0.0.0",
+        "port": 443,
+        "protocol": "vless",
+        "settings": {
+          "clients": [
+            {
+              "email": "link:hub-exit",
+              "id": "015e60a8-0ff9-4a79-ad5f-f2f7920f5028"
+            }
+          ],
+          "decryption": "none"
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "realitySettings": {
+            "privateKey": "SDON5__7OVb8Wo9-hETiO_8bkP7DZLzLJMJhi0uopkg",
+            "serverNames": [
+              "www.example.org"
+            ],
+            "shortIds": [
+              "a267e77a71abbc49"
+            ],
+            "target": "www.example.org:443"
+          },
+          "security": "reality",
+          "xhttpSettings": {
+            "path": "/tx"
+          }
+        },
+        "tag": "in-main"
+      }
+    ],
+    "log": {
+      "loglevel": "warning"
+    },
+    "outbounds": [
+      {
+        "protocol": "blackhole",
+        "tag": "block"
+      },
+      {
+        "protocol": "freedom",
+        "tag": "direct"
+      },
+      {
+        "protocol": "freedom",
+        "settings": {
+          "redirect": "127.0.0.1:7700"
+        },
+        "tag": "tunxd"
+      }
+    ],
+    "routing": {
+      "domainStrategy": "AsIs",
+      "rules": [
+        {
+          "inboundTag": [
+            "in-main"
+          ],
+          "outboundTag": "tunxd",
+          "user": [
+            "link:hub-exit"
+          ]
+        },
+        {
+          "inboundTag": [
+            "in-main"
+          ],
+          "outboundTag": "block"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,156 @@
+# A whole tunx network for tunx-hub (`tunx-hub import examples/network.yaml`).
+#
+# A public hub, two site gateways that dial the hub over VLESS + REALITY, a
+# remote exit node the hub dials over VLESS + REALITY + XHTTP, and a phone
+# attached to the hub. Site A reaches site B and the internet through the
+# hub; the exit is reached only through the hub.
+#
+# Keys, UUIDs, short IDs and passwords below are example values. Leave them
+# out and the hub generates them; public keys are set at enrolment.
+
+network:
+  name: example
+  prefixes: [10.200.0.0/24, fd74:756e:7800::/64]
+  dns_suffix: tunx.internal
+
+groups:
+  - name: sites
+    members: [tag:site]
+
+nodes:
+  - name: exit
+    public_key: MCuN82pQdmcBcq56rRhxKdmRTvJoGQ+5+pttotl+GvU=
+    addresses: [10.200.0.4, fd74:756e:7800::4]
+    tags: [remote]
+    capabilities: [listen, exit]
+    endpoints:
+      - name: main
+        transport: reality
+        address: exit.example.net
+        port: 443
+        network: xhttp
+        path: /tx
+        reality:
+          target: www.example.org:443
+          server_names: [www.example.org]
+          private_key: SDON5__7OVb8Wo9-hETiO_8bkP7DZLzLJMJhi0uopkg
+  - name: hub
+    public_key: Tlsnm/UmIl4hNQhD2zypl+u/JdYC0RotgT7JvUKQxpc=
+    addresses: [10.200.0.1, fd74:756e:7800::1]
+    tags: [core]
+    capabilities: [listen, relay]
+    endpoints:
+      - name: reality
+        transport: reality
+        address: hub.example.com
+        port: 443
+        reality:
+          target: www.example.com:443
+          server_names: [www.example.com]
+          private_key: aPtzynhj5ZvKwhF91yjmUrrIylw47XZHswlE6GPNUns
+        clients: true
+    status: 127.0.0.1:7790
+  - name: site-a
+    public_key: RC6GLc35UndsjWjZJlmzwS+XdFlfUCHPR1sslB0XWc4=
+    addresses: [10.200.0.2, fd74:756e:7800::2]
+    tags: [site]
+    capabilities: [advertise]
+    tun: {name: tunx0, mtu: 1400}
+  - name: site-b
+    public_key: S2CjiEuGijAwFiGcYrzGJ/cywOImURFiKansnh3Xbyw=
+    addresses: [10.200.0.3, fd74:756e:7800::3]
+    tags: [site]
+    capabilities: [advertise]
+    tun: {name: tunx0, mtu: 1400}
+
+links:
+  - name: a-hub
+    dialer: site-a
+    listener: hub
+    endpoint: reality
+    uuid: d47897ee-b466-4238-8aa8-781608aa24c9
+    short_id: 6289c0040f4a75a7
+  # Site B's link may only use its uplink interface.
+  - name: b-hub
+    dialer: site-b
+    listener: hub
+    endpoint: reality
+    interface: eth1
+    uuid: 28506096-9aed-4c94-8359-6cf0916d1cb6
+    short_id: fcf33702d1a427ef
+  - name: hub-exit
+    dialer: hub
+    listener: exit
+    endpoint: main
+    cost: 20
+    uuid: 015e60a8-0ff9-4a79-ad5f-f2f7920f5028
+    short_id: a267e77a71abbc49
+
+routes:
+  # Delivered with the original source; site A's router routes the overlay
+  # and site B back to its gateway.
+  - name: site-a-lan
+    prefix: 10.0.1.0/24
+    advertisers:
+      - {node: site-a, source: preserve}
+  - name: site-b-lan
+    prefix: 10.0.2.0/24
+    advertisers:
+      - {node: site-b, source: snat}
+
+# First match wins; no match denies.
+access:
+  - name: core-any
+    priority: 10
+    action: allow
+    sources: [tag:core]
+  - name: a-to-b
+    priority: 20
+    action: allow
+    sources: [node:site-a]
+    destinations: [10.0.2.0/24, node:site-b]
+    proto: [tcp, udp, icmp]
+  - name: b-to-a-ssh
+    priority: 30
+    action: allow
+    sources: [node:site-b]
+    destinations: [10.0.1.0/24]
+    proto: [tcp]
+    ports: [22]
+  - name: phone-lans
+    priority: 40
+    action: allow
+    sources: [client:phone]
+    destinations: [10.0.1.0/24, 10.0.2.0/24]
+  - name: ping-hub
+    priority: 50
+    action: allow
+    sources: [group:sites, client:phone]
+    destinations: [node:hub]
+    proto: [icmp]
+  - name: no-other-private
+    priority: 60
+    action: deny
+    destinations: [10.0.0.0/8, 10.200.0.0/24, fd74:756e:7800::/64]
+  - name: internet
+    priority: 70
+    action: allow
+    sources: [group:sites, client:phone]
+
+egress:
+  # Internet traffic of the sites and the phone leaves through the exit;
+  # when the exit is unreachable it is dropped, never sent directly.
+  - name: via-exit
+    priority: 10
+    sources: [group:sites, client:phone]
+    exit: exit
+    xray_rules:
+      - {domain: ["domain:ads.example.org"], outboundTag: block}
+
+clients:
+  - name: phone
+    node: hub
+    endpoint: reality
+    uuid: 40163530-55b6-4c57-b282-96c34879f4c7
+    short_id: 823a5f77f5284c15
+    password: ukeHnOSm71per9F6iph68NQq
