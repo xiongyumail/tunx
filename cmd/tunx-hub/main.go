@@ -37,7 +37,7 @@ commands:
   serve [-listen ADDR] [-tls-cert FILE -tls-key FILE] [-insecure-cookie]
                          serve the API and the web panel (default 127.0.0.1:8780)
   render NODE            print the rendered configs of a node (JSON)
-  import FILE            replace the network with a YAML file ("-": stdin)
+  import [-dry-run] FILE replace the network with a YAML file ("-": stdin)
   export FILE            write the network as YAML ("-": stdout)
   token NAME             create an API token and print it once
   enroll-token NODE      create a one-time enrolment token and print it
@@ -78,12 +78,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		err = cmdServe(*db, *listen, *cert, *key, *insecure, stderr)
 	case "render", "import", "export", "token", "enroll-token":
+		var dryRun *bool
+		if cmd == "import" {
+			dryRun = fs.Bool("dry-run", false, "validate and print changes without writing")
+		}
 		if fs.Parse(args) != nil || fs.NArg() != 1 {
 			fmt.Fprint(stderr, usage)
 			return 2
 		}
 		err = withStore(*db, func(st *store.Store) error {
-			return oneArg(st, cmd, fs.Arg(0), stdin, stdout, stderr)
+			return oneArg(st, cmd, fs.Arg(0), dryRun != nil && *dryRun, stdin, stdout, stderr)
 		})
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
@@ -210,7 +214,7 @@ func isLoopback(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func oneArg(st *store.Store, cmd, arg string, stdin io.Reader, stdout, stderr io.Writer) error {
+func oneArg(st *store.Store, cmd, arg string, dryRun bool, stdin io.Reader, stdout, stderr io.Writer) error {
 	ctx := context.Background()
 	switch cmd {
 	case "render":
@@ -243,7 +247,12 @@ func oneArg(st *store.Store, cmd, arg string, stdin io.Reader, stdout, stderr io
 		if err != nil {
 			return err
 		}
-		changes, err := st.Import(ctx, "cli", spec)
+		var changes []store.Change
+		if dryRun {
+			changes, err = st.PreviewImport(ctx, spec)
+		} else {
+			changes, err = st.Import(ctx, "cli", spec)
+		}
 		if err != nil {
 			return err
 		}

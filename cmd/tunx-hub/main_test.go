@@ -36,6 +36,13 @@ func TestCLI(t *testing.T) {
 		t.Fatal("second init accepted")
 	}
 
+	code, out, errs = runCmd(t, "", "import", "-db", db, "-dry-run", "../../examples/network.yaml")
+	if code != 0 || !strings.Contains(out, "create nodes hub") {
+		t.Fatalf("dry-run import: %d %s %s", code, out, errs)
+	}
+	if code, _, _ := runCmd(t, "", "render", "-db", db, "site-a"); code != 1 {
+		t.Fatal("dry-run import changed the database")
+	}
 	code, out, errs = runCmd(t, "", "import", "-db", db, "../../examples/network.yaml")
 	if code != 0 || !strings.Contains(out, "create nodes hub") {
 		t.Fatalf("import: %d %s %s", code, out, errs)
