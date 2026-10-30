@@ -9,6 +9,8 @@ trap 'rm -rf "$tmp"' EXIT
 
 bash -n install.sh
 shellcheck -x install.sh tests/*.sh
+bash tests/options.sh
+bash tests/timezone.sh
 
 # shellcheck source-path=SCRIPTDIR/..
 . ./install.sh

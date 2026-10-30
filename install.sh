@@ -45,7 +45,11 @@ UNIT_GUARD=/etc/systemd/system/tunx-guard.service
 STATE_DIR=/var/lib/tunx
 NM_CONF=/etc/NetworkManager/conf.d/90-tunx.conf
 SYSCTL_CONF=/etc/sysctl.d/90-tunx-gateway.conf
+WSL_CONF=/etc/wsl.conf
+TIMEZONE_FILE=/etc/timezone
+ZONEINFO_DIR=/usr/share/zoneinfo
 GATEWAY=0
+IPV6_ENABLED=1
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -74,6 +78,9 @@ Install options:
   --tun-name NAME      TUN interface name (default: $TUN_NAME)
   --gateway            Also forward the traffic of LAN clients that use this host
                        as their gateway into the TUN (kept on later installs)
+  --disable-ipv6       Disable IPv6 on the TUN (kept on later installs)
+  --enable-ipv6        Enable IPv6 on the TUN (default on first install)
+                       Repeating the same flag is allowed; opposite flags conflict.
 EOF
 }
 
@@ -82,8 +89,11 @@ need_root() { [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"; }
 is_wsl() { grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; }
 
 load_env() {
+    # Installs made before the IPv6 option used dual-stack routing.
+    IPV6_ENABLED=1
     # shellcheck disable=SC1091
     [ -r "$CONF_DIR/net.env" ] && . "$CONF_DIR/net.env"
+    case "$IPV6_ENABLED" in 0 | 1) ;; *) die "invalid IPV6_ENABLED in $CONF_DIR/net.env (expected 0 or 1)" ;; esac
     return 0
 }
 
@@ -97,10 +107,10 @@ xray_asset_name() {
 
 check_deps() {
     local missing=()
-    for c in curl unzip ip nft systemctl sha256sum python3; do
+    for c in curl unzip ip nft systemctl sysctl sha256sum python3; do
         command -v "$c" >/dev/null || missing+=("$c")
     done
-    [ ${#missing[@]} -eq 0 ] || die "missing commands: ${missing[*]} (apt install curl unzip iproute2 nftables python3)"
+    [ ${#missing[@]} -eq 0 ] || die "missing commands: ${missing[*]} (apt install curl unzip iproute2 nftables procps python3)"
     [ -d /run/systemd/system ] || die "systemd is not running (on WSL set [boot] systemd=true in /etc/wsl.conf)"
     [ -c /dev/net/tun ] || modprobe tun 2>/dev/null || true
     [ -c /dev/net/tun ] || die "/dev/net/tun not available"
@@ -145,6 +155,8 @@ install_xray() {
 }
 
 write_starter_config() {
+    local dns_strategy=UseIP
+    [ "$IPV6_ENABLED" = 1 ] || dns_strategy=UseIPv4
     install -d -m 755 "$CONF_DIR"
     (umask 077; cat >"$CONFIG") <<EOF
 // tunx starter config. Edit the "proxy" outbound and the routing rules,
@@ -159,7 +171,7 @@ write_starter_config() {
   // "domains", which is queried directly.
   "dns": {
     "tag": "dns-internal",
-    "queryStrategy": "UseIP",
+    "queryStrategy": "$dns_strategy",
     "serveStale": true,
     "serveExpiredTTL": 3600,
     "servers": [
@@ -315,6 +327,7 @@ write_net_env() {
         printf 'TUN_NAME="%s"\n' "$TUN_NAME"
         printf 'XRAY_UID="%s"\n' "$(id -u "$XRAY_USER")"
         printf 'GATEWAY="%s"\n' "$GATEWAY"
+        printf 'IPV6_ENABLED="%s"\n' "$IPV6_ENABLED"
     } >"$CONF_DIR/net.env"
 }
 
@@ -346,8 +359,8 @@ write_net_script() {
 # Policy routing and firewall for the Xray TUN (managed by tunx).
 # Sockets of the Xray user, and replies to connections opened from outside, use
 # the main table; everything else, LAN included, goes to table $TABLE and Xray
-# does the routing. IPv4 and IPv6 both go to the TUN; the table's fallback is
-# unreachable, so traffic fails closed while Xray is down.
+# does the routing. IPv6 enters the TUN only when enabled; both families keep
+# the unreachable fallback, so disabled IPv6 and downtime fail closed.
 # Routing alone cannot stop a program that binds its socket to a physical
 # interface: when the lookup fails, the kernel sends it out as if on-link. The
 # nftables table drops such packets unless they belong to a connection of the Xray
@@ -526,10 +539,16 @@ case "\${1:-}" in
     ip link set "\$TUN_NAME" up
     ip addr replace $TUN_ADDR dev "\$TUN_NAME"
     ip route replace default dev "\$TUN_NAME" metric 10 table $TABLE
-    # Without IPv6 on the TUN, IPv6 simply stays unreachable.
     if [ "\$fams" != "-4" ]; then
-      ip -6 addr replace $TUN_ADDR6 dev "\$TUN_NAME" nodad &&
-        ip -6 route replace default dev "\$TUN_NAME" metric 10 table $TABLE || true
+      if [ "\${IPV6_ENABLED:-1}" = 1 ]; then
+        sysctl -qw "net/ipv6/conf/\$TUN_NAME/disable_ipv6=0" || exit 1
+        ip -6 addr replace $TUN_ADDR6 dev "\$TUN_NAME" nodad || exit 1
+        ip -6 route replace default dev "\$TUN_NAME" metric 10 table $TABLE || exit 1
+      else
+        ip -6 route del default dev "\$TUN_NAME" metric 10 table $TABLE 2>/dev/null || true
+        # Disabling the interface removes its IPv6 addresses and connected routes.
+        sysctl -qw "net/ipv6/conf/\$TUN_NAME/disable_ipv6=1" || exit 1
+      fi
     fi
     ;;
   *) echo "usage: \$0 policy-up|policy-down|ensure|watch|tun-up" >&2; exit 2 ;;
@@ -601,18 +620,54 @@ EOF
 
 # wsl_conf_set SECTION KEY VALUE: set a key in /etc/wsl.conf; the original file
 # is kept once and restored on uninstall.
-wsl_conf_set() {
-    install -d "$STATE_DIR"
-    touch /etc/wsl.conf
-    [ -e "$STATE_DIR/wsl.conf.orig" ] || cp /etc/wsl.conf "$STATE_DIR/wsl.conf.orig"
-    if grep -q "^$2" /etc/wsl.conf; then
-        sed -i "s/^$2.*/$2=$3/" /etc/wsl.conf
-    elif grep -q "^\[$1\]" /etc/wsl.conf; then
-        sed -i "/^\[$1\]/a $2=$3" /etc/wsl.conf
-    else
-        printf '\n[%s]\n%s=%s\n' "$1" "$2" "$3" >>/etc/wsl.conf
+wsl_conf_set() (
+    local backup_tmp=""
+    install -d "$STATE_DIR" || return 1
+    umask 077
+    exec 8>"$STATE_DIR/wsl.conf.lock" || return 1
+    flock 8 || return 1
+    trap '[ -z "$backup_tmp" ] || rm -f -- "$backup_tmp"' EXIT
+    trap 'exit 1' HUP INT TERM
+    touch "$WSL_CONF" || return 1
+    if [ ! -e "$STATE_DIR/wsl.conf.orig" ] && [ ! -L "$STATE_DIR/wsl.conf.orig" ]; then
+        backup_tmp=$(mktemp "$STATE_DIR/wsl.conf.orig.XXXXXX") || return 1
+        cp "$WSL_CONF" "$backup_tmp" || return 1
+        # Publish only a complete copy. Never replace a backup from another call.
+        mv -n -- "$backup_tmp" "$STATE_DIR/wsl.conf.orig" || return 1
     fi
-}
+    python3 -I - "$WSL_CONF" "$1" "$2" "$3" <<'EOF'
+import re, sys
+path, section, key, value = sys.argv[1:]
+with open(path, newline="") as f:
+    lines = f.readlines()
+newline = "\r\n" if any(s.endswith("\r\n") for s in lines) else "\n"
+header = re.compile(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$")
+entry = re.compile(r"^(\s*" + re.escape(key) + r"\s*=\s*)[^#;\r\n]*?([ \t]*(?:[#;].*)?)(\r?\n)?$", re.I)
+inside, found, first = False, False, None
+for i, line in enumerate(lines):
+    match = header.match(line)
+    if match:
+        inside = match[1].strip().casefold() == section.casefold()
+        if inside and first is None:
+            first = i + 1
+    elif inside:
+        match = entry.match(line)
+        if match:
+            lines[i] = match[1] + value + match[2] + (match[3] or "")
+            found = True
+if not found:
+    if first is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += newline
+        lines += [newline + "[" + section + "]" + newline, key + "=" + value + newline]
+    else:
+        if not lines[first - 1].endswith("\n"):
+            lines[first - 1] += newline
+        lines.insert(first, key + "=" + value + newline)
+with open(path, "w", newline="") as f:
+    f.writelines(lines)
+EOF
+)
 
 setup_dns() {
     install -d "$STATE_DIR"
@@ -642,7 +697,7 @@ restore_dns() {
         log "Restored /etc/resolv.conf"
     fi
     if [ -e "$STATE_DIR/wsl.conf.orig" ]; then
-        cp "$STATE_DIR/wsl.conf.orig" /etc/wsl.conf
+        cp "$STATE_DIR/wsl.conf.orig" "$WSL_CONF"
         log "Restored /etc/wsl.conf"
     fi
     if [ -e "$NM_CONF" ]; then
@@ -686,7 +741,7 @@ restore_gateway_sysctl() {
 }
 
 cmd_install() {
-    local config="" version="$XRAY_VERSION_DEFAULT" zip="" via=""
+    local config="" version="$XRAY_VERSION_DEFAULT" zip="" via="" ipv6_option=""
     load_env
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -696,6 +751,11 @@ cmd_install() {
             --proxy) via="$2"; shift 2 ;;
             --tun-name) TUN_NAME="$2"; shift 2 ;;
             --gateway) GATEWAY=1; shift ;;
+            --enable-ipv6 | --disable-ipv6)
+                [ -z "$ipv6_option" ] || [ "$ipv6_option" = "$1" ] || die "--enable-ipv6 and --disable-ipv6 are mutually exclusive"
+                ipv6_option="$1"
+                if [ "$1" = --enable-ipv6 ]; then IPV6_ENABLED=1; else IPV6_ENABLED=0; fi
+                shift ;;
             -h | --help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -720,6 +780,9 @@ cmd_install() {
     else
         write_starter_config
         starter=1
+    fi
+    if [ "$IPV6_ENABLED" = 0 ] && [ "$starter" = 0 ]; then
+        warn "IPv6 is disabled on the TUN; the supplied or existing config is unchanged and may still return AAAA DNS answers"
     fi
     ensure_user
     protect_config
@@ -752,20 +815,98 @@ cmd_install() {
     fi
 }
 
+valid_timezone() {
+    [[ "$1" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -f "$ZONEINFO_DIR/$1" ]
+}
+
+save_timezone() {
+    local cur="$1" tmp
+    [ ! -e "$STATE_DIR/timezone.orig" ] || return 0
+    tmp=$(mktemp -d "$STATE_DIR/timezone-save.XXXXXX") || return 1
+    if [ -e "$TIMEZONE_FILE" ] || [ -L "$TIMEZONE_FILE" ]; then
+        cp -p "$TIMEZONE_FILE" "$tmp/timezone.file.orig" || return 1
+        echo present >"$tmp/timezone.file.state" || return 1
+        mv "$tmp/timezone.file.orig" "$STATE_DIR/timezone.file.orig" || return 1
+    else
+        echo absent >"$tmp/timezone.file.state" || return 1
+    fi
+    mv "$tmp/timezone.file.state" "$STATE_DIR/timezone.file.state" || return 1
+    printf '%s\n' "$cur" >"$tmp/timezone.orig" || return 1
+    # Commit the zone name last so a partial file backup is never used.
+    mv "$tmp/timezone.orig" "$STATE_DIR/timezone.orig" || return 1
+    rmdir "$tmp"
+}
+
+restore_timezone() {
+    local tz state=legacy
+    [ -e "$STATE_DIR/timezone.orig" ] || return 0
+    tz=$(cat "$STATE_DIR/timezone.orig") || return 1
+    valid_timezone "$tz" || { warn "cannot restore invalid saved time zone; backup state kept"; return 1; }
+    if [ -e "$STATE_DIR/timezone.file.state" ]; then
+        state=$(cat "$STATE_DIR/timezone.file.state") || return 1
+    fi
+    case "$state" in
+        present) [ -r "$STATE_DIR/timezone.file.orig" ] || { warn "cannot restore missing time zone file backup; backup state kept"; return 1; } ;;
+        absent | legacy) ;;
+        *) warn "cannot restore invalid time zone file state; backup state kept"; return 1 ;;
+    esac
+    timedatectl set-timezone "$tz" || { warn "cannot restore Linux time zone $tz; backup state kept"; return 1; }
+    case "$state" in
+        present) cp -p -T "$STATE_DIR/timezone.file.orig" "$TIMEZONE_FILE" || { warn "cannot restore $TIMEZONE_FILE; backup state kept"; return 1; } ;;
+        absent) rm -f "$TIMEZONE_FILE" || { warn "cannot remove $TIMEZONE_FILE to restore its absence; backup state kept"; return 1; } ;;
+        legacy)
+            # Older installs saved only the zone name, not this file's contents.
+            if [ -e "$TIMEZONE_FILE" ]; then
+                printf '%s\n' "$tz" >"$TIMEZONE_FILE" || { warn "cannot restore $TIMEZONE_FILE; backup state kept"; return 1; }
+            fi ;;
+    esac
+    log "Restored Linux time zone $tz"
+}
+
+timezone_status() {
+    local tz sync
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    echo "Time zone: ${tz:-unknown} (Linux)"
+    if is_wsl; then
+        sync=$(python3 -I - "$WSL_CONF" <<'EOF'
+import re, sys
+inside, value = False, "default (true)"
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            header = re.match(r"^\s*\[([^]]+)\]\s*(?:[#;].*)?$", line)
+            if header:
+                inside = header[1].strip().casefold() == "time"
+            elif inside:
+                entry = re.match(r"^\s*useWindowsTimezone\s*=\s*([^#;]*)", line, re.I)
+                if entry:
+                    value = entry[1].strip()
+except FileNotFoundError:
+    pass
+print(value)
+EOF
+) || sync=unknown
+        echo "WSL time sync: $sync (configured; applies after distribution restart; Windows unchanged)"
+    fi
+}
+
 cmd_tz() {
     local tz cur
     [ -d "$STATE_DIR" ] || die "tunx is not installed (run install first)"
     tz=$(curl -s --max-time 10 https://ipinfo.io/json | python3 -I -c 'import json, sys; print(json.load(sys.stdin).get("timezone", ""))' 2>/dev/null || true)
     [ -n "$tz" ] || tz=$(curl -s --max-time 10 https://ipapi.co/timezone/ || true)
-    { [[ "$tz" =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -e "/usr/share/zoneinfo/$tz" ]; } || die "cannot get the egress time zone (got: ${tz:-nothing})"
-    cur=$(timedatectl show -p Timezone --value 2>/dev/null || true)
-    [ -e "$STATE_DIR/timezone.orig" ] || echo "${cur:-UTC}" >"$STATE_DIR/timezone.orig"
+    valid_timezone "$tz" || die "cannot get the egress time zone (got: ${tz:-nothing})"
+    cur=$(timedatectl show -p Timezone --value 2>/dev/null) || die "cannot read the original Linux time zone"
+    valid_timezone "$cur" || die "cannot read a valid original Linux time zone (got: ${cur:-nothing})"
+    save_timezone "$cur" || die "cannot save the original time zone; no time zone change was made"
     # Otherwise WSL resets the time zone to the Windows one at every start.
-    if is_wsl; then wsl_conf_set time useWindowsTimezone false; fi
-    timedatectl set-timezone "$tz"
+    if is_wsl; then wsl_conf_set time useWindowsTimezone false || die "cannot configure WSL time sync; backup state kept"; fi
+    timedatectl set-timezone "$tz" || die "cannot set Linux time zone $tz; backup state kept"
     # Debian-based systems also keep the name here; Java and tzlocal read it first.
-    if [ -e /etc/timezone ]; then echo "$tz" >/etc/timezone; fi
-    log "Time zone set to $tz (was ${cur:-unknown})"
+    if [ -e "$TIMEZONE_FILE" ]; then printf '%s\n' "$tz" >"$TIMEZONE_FILE" || die "cannot update $TIMEZONE_FILE; backup state kept"; fi
+    log "Linux time zone set to $tz (was $cur)"
+    if is_wsl; then log "WSL time sync is disabled after the distribution restarts; Windows time zone is unchanged"; fi
+    log "Running applications may need their own restart to use the new time zone"
 }
 
 cmd_check() {
@@ -784,6 +925,7 @@ cmd_reload() {
 }
 
 cmd_uninstall() {
+    restore_timezone || return 1
     # The guard first, or it would put the rules back.
     systemctl disable --now tunx-guard.service >/dev/null 2>&1 || true
     systemctl disable --now tunx.service tunx-policy.service >/dev/null 2>&1 || true
@@ -799,12 +941,6 @@ cmd_uninstall() {
     systemctl daemon-reload
     restore_gateway_sysctl
     restore_dns
-    if [ -e "$STATE_DIR/timezone.orig" ]; then
-        local tz
-        tz=$(cat "$STATE_DIR/timezone.orig")
-        timedatectl set-timezone "$tz" && log "Restored time zone $tz"
-        if [ -e /etc/timezone ]; then echo "$tz" >/etc/timezone; fi
-    fi
     rm -rf "$STATE_DIR"
     userdel "$XRAY_USER" 2>/dev/null || true
     log "Removed. Traffic now uses the normal route."
@@ -814,6 +950,8 @@ cmd_status() {
     load_env
     systemctl --no-pager --lines=5 status tunx.service 2>/dev/null | sed -n '1,5p' || true
     echo "Guard: $(systemctl is-active tunx-guard.service 2>/dev/null)"
+    if [ "$IPV6_ENABLED" = 1 ]; then echo "IPv6: enabled (TUN)"; else echo "IPv6: disabled (TUN; DNS config is independent)"; fi
+    timezone_status
     echo
     echo "Rules:"; ip rule show | grep -E "^($RULE_XRAY|$RULE_INBOUND|$RULE_ICMP|$RULE_TUNBACK|$RULE_TUN):" || echo "  (none)"
     if [ "${GATEWAY:-0}" = 1 ]; then echo "Gateway: on (ip_forward=$(sysctl -n net.ipv4.ip_forward))"; fi
@@ -825,6 +963,7 @@ cmd_status() {
 }
 
 cmd_test() {
+    load_env
     local fail=0 noenv=(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY)
     local tcp dns udp
     tcp=$("${noenv[@]}" curl -s --max-time 10 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}' || true)
@@ -855,10 +994,15 @@ EOF
 )
         echo "UDP (STUN) : ${udp:-FAIL}"; [ -n "$udp" ] || fail=1
     fi
-    # Informational: IPv6 works only if the upstream has IPv6.
+    # Enabled IPv6 depends on the upstream. Disabled IPv6 must not have egress.
     local v6
     v6=$("${noenv[@]}" curl -s -6 --max-time 8 'https://[2606:4700:4700::1111]/cdn-cgi/trace' | awk -F= '/^ip=/{print $2}' || true)
-    echo "IPv6       : ${v6:-none}"
+    if [ "$IPV6_ENABLED" = 0 ]; then
+        echo "IPv6       : ${v6:-none} (disabled; expected none)"
+        [ -z "$v6" ] || fail=1
+    else
+        echo "IPv6       : ${v6:-none}"
+    fi
     # Other programs must not get around the TUN by binding to the physical
     # interface: the firewall drops the packet and sendto fails with EPERM.
     local dev bind

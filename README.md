@@ -32,9 +32,15 @@ Bind eth0  : blocked
 | `sudo ./install.sh reload` | Check `/etc/tunx/config.json`, then restart Xray. Nothing is restarted if the check fails |
 | `sudo ./install.sh check` | Only check the config |
 | `sudo ./install.sh uninstall` | Remove all files, restore `resolv.conf` and `wsl.conf`; the config is backed up to `/root/tunx-config-*.json` |
-| `./install.sh status` | Service, routing rules, and DNS status |
+| `./install.sh status` | Service, routing rules, DNS, Linux time zone and configured WSL time sync status |
 | `./install.sh test` | Check the egress address for TCP, DNS, UDP (STUN), and IPv6 |
-| `sudo ./install.sh tz` | Optional: set the system time zone to that of the egress IP (looked up at ipinfo.io through the TUN). It also updates `/etc/timezone` where it exists (read first by Java and tzlocal). On WSL it also writes `useWindowsTimezone=false`, otherwise WSL resets it at every start. Uninstall restores both; rerun after changing the exit |
+| `sudo ./install.sh tz` | Optional: set the Linux time zone to that of the egress IP (looked up through the TUN). Rerun after changing the exit. Windows is unchanged |
+
+`tz` updates Linux `/etc/localtime` through `timedatectl` and updates `/etc/timezone` where it exists. Some applications read `/etc/timezone` first; running applications may cache the old zone and need their own restart. The command does not restart applications or services.
+
+On WSL, `tz` sets `[time] useWindowsTimezone=false` in `/etc/wsl.conf`. That setting takes effect after the distribution restarts. It prevents later starts from replacing the Linux zone with the Windows zone. Windows time and its time zone are unchanged. `status` shows the Linux zone and the configured sync setting; it does not verify whether WSL has applied a recent edit.
+
+The first `tz` call saves the original Linux zone and exact `/etc/timezone` contents or absence. Repeated calls keep that backup. Uninstall restores it before removing files; a failed time zone or file restoration stops uninstall and keeps the backup for retry. Older installations with only `timezone.orig` restore the saved zone and update `/etc/timezone` if it exists; its former contents or absence cannot be recovered. The original `/etc/wsl.conf` backup remains compatible and is restored on uninstall; its time sync setting also takes effect after a distribution restart.
 
 Install options:
 
@@ -46,8 +52,21 @@ Install options:
 | `--proxy URL` | none | Proxy used only to download Xray, e.g. `socks5h://192.168.1.10:1080` |
 | `--tun-name NAME` | `tunx0` | TUN interface name, at most 15 characters; must match `name` in the config |
 | `--gateway` | off | Gateway mode, see below. Kept on later installs until uninstall |
+| `--disable-ipv6` | IPv6 enabled | Disable IPv6 on the TUN. Kept on later installs |
+| `--enable-ipv6` | IPv6 enabled | Enable IPv6 on the TUN, including after a previous disable |
 
 Reinstalling with the same version skips the download.
+
+IPv6 is enabled on first install and on existing installs without an IPv6 setting. Later installs keep the choice in `/etc/tunx/net.env` unless one of the IPv6 flags is supplied. Repeating the same flag is allowed; supplying both flags is an error.
+
+```bash
+sudo ./install.sh install --disable-ipv6
+sudo ./install.sh install --enable-ipv6
+```
+
+With IPv6 disabled, the TUN has no IPv6 address or default route. IPv6 policy rules and the unreachable fallback remain, so ordinary IPv6 traffic is blocked. The setting applies to the TUN; Xray's own outbound connections and replies to inbound connections still use the main table. `status` reports the setting, and `test` expects `IPv6 : none` in disabled mode and fails if it observes an IPv6 egress address.
+
+A newly generated starter config uses `dns.queryStrategy: UseIPv4` when IPv6 is disabled. Existing and supplied configs are preserved and may still return AAAA answers; install warns about this. To suppress AAAA answers, set the built-in DNS query strategy to `UseIPv4` in that config. Re-enabling IPv6 does not change its DNS settings. The gateway example keeps its IPv4-only DNS behavior.
 
 ## Gateway mode
 
@@ -91,7 +110,7 @@ Examples:
   - `8995`: replies to connections opened from outside through a physical interface (e.g. Windows connecting to a server in WSL) use the original routing table, so they leave the way the request came in. These connections are marked with conntrack. Connections this host opens to on-link addresses, such as the Windows host, go through the TUN and leave through Xray's `direct` outbound.
   - `9100`: everything else looks up routing table 100, whose default route points to the TUN.
 - An nftables table `inet tunx` drops packets leaving a physical interface unless they belong to a connection opened by the `tunx` user (tracked with a conntrack mark, so the data, FIN and RST the kernel still sends after Xray closes a socket get out), reply to an inbound connection, or are broadcast, multicast, link-local or DHCP. Routing alone is not enough: when a program binds its socket to the physical interface and the lookup fails, the kernel sends the packet out as if the destination were on-link. With the table in place, binding to the interface gets a permission error instead, and an unprivileged user cannot take another user's identity. `test` checks this (`Bind eth0 : blocked`).
-- IPv4 and IPv6 get the same rules (IPv6 only if the kernel has it). The TUN has `198.18.0.1/30` and `fdfe:dcba:9876::1/126`, so IPv6 also enters Xray and is carried inside the upstream connection; this works even when the host itself has no IPv6. Programs with Happy Eyeballs (curl, browsers) may pick IPv6 for dual-stack hosts; both families leave through the same upstream.
+- IPv4 and IPv6 get the same rules (IPv6 only if the kernel has it). The TUN has `198.18.0.1/30` and, when IPv6 is enabled, `fdfe:dcba:9876::1/126`. Enabled IPv6 enters Xray and is carried inside the upstream connection; this works even when the host itself has no IPv6. Programs with Happy Eyeballs (curl, browsers) may pick IPv6 for dual-stack hosts; both families leave through the same upstream. With `--disable-ipv6`, IPv6 is disabled on the TUN and table 100 keeps only its unreachable IPv6 default.
 - The routing rules are installed by `tunx-policy.service` before the network is up (`Before=network-pre.target`), so nothing leaves directly during boot while Xray is still starting. A reinstall refreshes them in place instead of removing and re-adding them. Stopping `tunx-policy.service` (which also stops Xray, so traffic is blocked) or shutting down leaves them in place; only `uninstall` removes them. If the firewall cannot be loaded, the unit fails after the routing rules are in place, so Xray does not start and traffic stays blocked. `tunx-guard.service` watches routing and nftables changes (`ip monitor`, `nft monitor`) and also checks every 10 seconds. It compares the rule content, the fallback route and the whole firewall table with what was installed, and puts them back within about half a second if another tool removed or changed them (e.g. `nft flush ruleset`, a flushed chain, an added accept rule, a widened `uidrange`); its journal records each restore.
 - Table 100 has an `unreachable` fallback. If Xray dies, traffic is cut off instead of falling back to a direct connection and leaking; systemd restarts Xray after 2 seconds. During that time the LAN and the host are unreachable too; replies to inbound connections still work.
 - `/etc/resolv.conf` is changed to `1.1.1.1` and `8.8.8.8`, and DNS queries also go out through the TUN. On WSL the script also writes `generateResolvConf=false` to `/etc/wsl.conf` so a restart does not change it back. With NetworkManager, it writes `rc-manager=unmanaged` so a reconnect does not put the LAN resolver back (a LAN resolver is a private address and would be reached directly).
@@ -101,7 +120,7 @@ Examples:
 ## Requirements
 
 - systemd. On WSL, set `[boot] systemd=true` in `/etc/wsl.conf`.
-- `curl`, `unzip`, `iproute2`, `nftables`, `python3`; the `test` command also uses `dig` (`dnsutils`).
+- `curl`, `unzip`, `iproute2`, `nftables`, `procps` (`sysctl`), `python3`; the `test` command also uses `dig` (`dnsutils`).
 - x86_64 or arm64.
 
 ## Installed files
@@ -110,13 +129,13 @@ Examples:
 |:--|:--|
 | `/usr/local/bin/xray`, `/usr/local/share/xray/` | Xray and geo data |
 | `/etc/tunx/config.json` (mode 640, group `tunx`) | Your Xray config |
-| `/etc/tunx/net.env` | TUN interface name, uid of the `tunx` user |
+| `/etc/tunx/net.env` | TUN interface name, uid of the `tunx` user, gateway mode and IPv6 setting |
 | `/usr/local/sbin/tunx-net` | Policy routing script |
 | `tunx-policy.service`, `tunx.service` | Routing rules (oneshot) and the Xray service (runs as user `tunx` with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_NET_BIND_SERVICE`) |
 | user `tunx` | System user for Xray; removed on uninstall |
 | nftables table `inet tunx` | Firewall described above; loaded by `tunx-policy.service`, removed on uninstall |
 | `tunx-guard.service` | Restores the rules and the firewall if they are removed or changed |
-| `/var/lib/tunx/` | Backups of the original `resolv.conf`, `wsl.conf` and time zone, restored on uninstall |
+| `/var/lib/tunx/` | Backups of the original `resolv.conf`, `wsl.conf`, Linux time zone and `/etc/timezone` file state, restored on uninstall |
 | `/etc/NetworkManager/conf.d/90-tunx.conf` | Only with NetworkManager; removed on uninstall |
 
 ## Notes
@@ -129,7 +148,9 @@ Examples:
 
 ## Tests
 
-- `sudo tests/static.sh`: shell syntax and ShellCheck, and the generated policy script and nftables ruleset for the normal, WSL and gateway modes (`nft -c`, nothing is loaded).
+- `sudo tests/static.sh`: shell syntax and ShellCheck, isolated IPv6 and time zone checks, and the generated policy script and nftables ruleset for the normal, WSL and gateway modes (`nft -c`, nothing is loaded).
+- `bash tests/options.sh`: the isolated IPv6 option, policy and reporting checks only. No root or network access is needed.
+- `bash tests/timezone.sh`: time zone save/restore, failure handling, status and WSL configuration checks with mocked commands and temporary paths. No host configuration is changed.
 - `tests/config.sh`: downloads Xray into a temp dir, checks the examples and the starter config, and checks that broken configs are rejected.
 
 - `sudo tests/vm.sh`: installs tunx with `--gateway` in a Debian 13 KVM VM, with a SOCKS5 upstream on the host and a client in a network namespace. It checks the VM's own egress, that the client's TCP, UDP and DNS go through the gateway and mainland China addresses go direct, that the client is cut off while Xray is stopped (and the VM still answers SSH), recovery after `kill -9`, the guard restoring flushed rules, reboot, and uninstall. It changes the host network, so run it only on a throwaway machine.

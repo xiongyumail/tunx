@@ -26,9 +26,11 @@ for f in examples/*.jsonc; do
     check_config "$tmp/example.jsonc"
     echo "ok: $f"
 done
-write_starter_config >/dev/null
-check_config "$CONFIG"
-echo "ok: starter config"
+for IPV6_ENABLED in 1 0; do
+    write_starter_config >/dev/null
+    check_config "$CONFIG"
+    echo "ok: starter config (IPV6_ENABLED=$IPV6_ENABLED)"
+done
 
 # Broken variants of the gateway example; each must be rejected.
 XRAY_LOCATION_ASSET=$ASSET_DIR "$BIN" run -dump -c examples/gateway.jsonc >"$tmp/base.json"
