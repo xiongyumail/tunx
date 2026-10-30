@@ -159,20 +159,19 @@ the `vless://` share link.
 
 ### What tunxd must add
 
-1. **Config pull.** Enrol once (`POST /api/enroll`, write `node.key`, keep
-   the node token), then poll `GET /api/nodes/{name}/config` with
-   `If-None-Match: "<revision>"`; on 200 write the tunxd and Xray configs,
-   restart or reload Xray, reload tunxd. Keep the last config when the hub is
-   unreachable.
-2. **Reload.** Apply a new config without dropping flows: swap the route
+`tunxd enroll` and `tunxd pull` implement the one-time enrolment and ETag
+config download. The remaining node-side work is:
+
+1. **Reload.** Poll the hub, then apply a new config without dropping flows:
+   reload Xray, swap the route
    table and policy (route tables are already swapped atomically), add and
    remove peers and listeners, keep sessions to unchanged peers.
-3. **Client identity.** A `client_socks` section (`listen`, `users[]` with
+2. **Client identity.** A `client_socks` section (`listen`, `users[]` with
    `name` and `password`): a SOCKS5 server with username/password auth,
    CONNECT and UDP ASSOCIATE, that injects flows with `Identity` = the
    username and `Hops` = 0. Until then the section lives beside the tunxd
    config in the bundle.
-4. Optional: several `dial` addresses per peer, to use standby links.
+3. Optional: several `dial` addresses per peer, to use standby links.
 
 ## REST API
 

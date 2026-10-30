@@ -3,6 +3,8 @@
 //	tunxd run -c config.json     run the node
 //	tunxd check -c config.json   validate a config and print the TUN setup
 //	tunxd keygen                 print a new key pair
+//	tunxd enroll -hub URL -token-file FILE [-dir DIR]
+//	tunxd pull [-dir DIR]
 package main
 
 import (
@@ -31,6 +33,8 @@ const usage = `usage:
   tunxd run -c config.json     run the node
   tunxd check -c config.json   validate a config and print the TUN setup
   tunxd keygen                 print a new key pair
+  tunxd enroll -hub URL -token-file FILE [-dir DIR]
+  tunxd pull [-dir DIR]
 `
 
 // run executes a subcommand; ctx ending stops `run`.
@@ -42,6 +46,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "keygen":
 		return keygen(stdout, stderr)
+	case "enroll":
+		return enrollCommand(ctx, args[1:], stdout, stderr)
+	case "pull":
+		return pullCommand(ctx, args[1:], stdout, stderr)
 	case "check", "run":
 		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		fs.SetOutput(stderr)

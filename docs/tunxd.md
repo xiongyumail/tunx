@@ -4,9 +4,8 @@
 (`internal/link`), captures traffic from a TUN device (`internal/netstack`),
 routes every flow by destination prefix (`internal/route`), checks the access
 policy (`internal/policy`) and either forwards the flow over a link or
-delivers it on this host (`internal/egress`). This version uses a static
-config file; route exchange over control messages and config pushed by the
-controller come later.
+delivers it on this host (`internal/egress`). It can enrol with tunx-hub and
+pull rendered configuration; applying updates without restarting comes later.
 
 ## Commands
 
@@ -14,12 +13,21 @@ controller come later.
 tunxd keygen                 print a new key pair (JSON: private_key, public_key)
 tunxd check -c config.json   validate a config, print the public key and the TUN setup
 tunxd run -c config.json     run the node until SIGTERM or SIGINT
+tunxd enroll -hub URL -token-file FILE [-dir DIR]
+tunxd pull [-dir DIR]
 ```
 
 `run` logs JSON lines (slog) to stderr. On SIGTERM it stops accepting and
 dialing, closes all sessions and flows, and exits 0.
 
 Build: `go build -o tunxd ./cmd/tunxd`.
+
+`enroll` exchanges a one-time hub token, writes `node.key`, `hub.json`,
+`tunxd.json` and `xray.json` with mode 0600, then pulls the first bundle.
+The token file may be `-` to read stdin. Plain HTTP is accepted only for a
+loopback hub. `pull` sends the saved ETag and leaves the files untouched on
+304; a changed bundle is validated before its two config files are replaced.
+The node token and private key are never printed.
 
 ## How a flow is handled
 
