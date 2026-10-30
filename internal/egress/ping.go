@@ -95,9 +95,13 @@ func setupPing(fd int, meta core.FlowMeta, opts Options, v6 bool) error {
 func deliverEcho(ctx context.Context, meta core.FlowMeta, f core.Flow, opts Options) error {
 	c, err := openPing(meta, opts)
 	if err != nil {
+		core.Refuse(f, core.ReasonError)
 		return err
 	}
 	defer c.Close()
+	if err := core.Accept(f); err != nil {
+		return err
+	}
 	stop := context.AfterFunc(ctx, func() {
 		c.Close()
 		f.Close()

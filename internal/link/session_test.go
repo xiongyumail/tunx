@@ -157,6 +157,7 @@ func TestTCPHalfClose(t *testing.T) {
 func TestTCPPeerCloseFailsWrites(t *testing.T) {
 	cc, sc := testConfigs(t)
 	closer := core.HandlerFunc(func(ctx context.Context, meta core.FlowMeta, f core.Flow, in core.Ingress) {
+		core.Accept(f)
 		f.Close()
 	})
 	c1, c2 := tcpPair(t)
@@ -366,8 +367,11 @@ func TestKeepaliveTimeout(t *testing.T) {
 
 	bh.enable()
 	start := time.Now()
-	waitDone(t, cs, 3*time.Second)
-	waitDone(t, ss, 3*time.Second)
+	waitDone(t, cs, cc.KeepaliveTimeout+150*time.Millisecond)
+	waitDone(t, ss, time.Second)
+	if elapsed := time.Since(start); elapsed > cc.KeepaliveTimeout+cc.KeepaliveTimeout/8+150*time.Millisecond {
+		t.Fatalf("blackhole detection exceeded timeout/check bound: %v", elapsed)
+	}
 	if !errors.Is(cs.Err(), ErrKeepalive) {
 		t.Fatalf("client err %v", cs.Err())
 	}

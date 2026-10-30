@@ -1,0 +1,370 @@
+# tunxd end to end on two-sites-tunxd.yaml with plain TCP links (no Xray):
+# TUN setup, LAN A <-> LAN B through the hub, IPv6, source preservation,
+# open answers (refused / denied / unreachable), link sockets kept out of the
+# TUN, unprivileged ping, failover to exit and back, SIGTERM, and throughput
+# and latency across the overlay.
+#
+#   sudo python3 sim.py run topologies/two-sites-tunxd.yaml scenarios/tunxd-plain.yaml \
+#        --set tunxd=/path/to/tunxd
+#
+# tests/sim/run-tunxd.sh builds tunxd and runs this in a test VM.
+
+name: tunxd-plain
+
+vars:
+  tunxd: ${sim}/../../bin/tunxd
+  probe: python3 ${sim}/probe.py
+  status: python3 ${sim}/tunxd/status.py
+  gen: python3 ${sim}/tunxd/gen.py --topo ${topo}/two-sites-tunxd.yaml --prefix ${prefix} --rundir ${run}
+
+steps:
+  # Setup: configs, tunxd on every overlay node, TUN created by name and
+  # configured with the commands `tunxd check` prints.
+  - name: generate configs
+    exec: ${gen} --mode plain --tunxd ${tunxd}
+    node: hub
+  - name: configs are valid
+    exec: for n in hub exit gw-a gw-b term-a; do /var/tmp/tunx-sim/${prefix}/tunxd check -c ${run}/nodes/$$n/tunxd.json | head -1 || exit 1; done
+    node: hub
+    match: 'config ok: node term-a'
+  - background: exec sh start.sh
+    node: hub
+  - background: exec sh start.sh
+    node: exit
+  - background: exec sh start.sh
+    node: gw-a
+  - background: exec sh start.sh
+    node: gw-b
+  - background: exec sh start.sh
+    node: term-a
+  - name: hub runs unprivileged
+    wait_until: ps -o user= -p $$(cat ${hub.dir}/tunxd.pid)
+    node: hub
+    match: '^nobody'
+    timeout: 10
+  - name: tunxd creates tunx0 (hub)
+    wait_until: ip -d link show tunx0
+    node: hub
+    match: 'tun type tun'
+    timeout: 10
+  - name: tunxd creates tunx0 (gw-a)
+    wait_until: ip -d link show tunx0
+    node: gw-a
+    match: 'tun type tun'
+    timeout: 10
+  - name: tunxd creates tunx0 (gw-b)
+    wait_until: ip -d link show tunx0
+    node: gw-b
+    match: 'tun type tun'
+    timeout: 10
+  - name: tunxd creates tunx0 (term-a)
+    wait_until: ip -d link show tunx0
+    node: term-a
+    match: 'tun type tun'
+    timeout: 10
+  - name: tunxd check commands set up hub
+    exec: sh ${hub.dir}/setup-tun.sh
+    node: hub
+    match: '10.200.0.1/24'
+  - name: tunxd check commands set up gw-a
+    exec: sh ${gw-a.dir}/setup-tun.sh
+    node: gw-a
+    match: '203.0.113.0/24'
+  - name: tunxd check commands set up gw-b
+    exec: sh ${gw-b.dir}/setup-tun.sh
+    node: gw-b
+    match: '2001:db8:113::/64'
+  - name: tunxd check commands set up term-a
+    exec: sh ${term-a.dir}/setup-tun.sh
+    node: term-a
+    match: 'fd00:b::/64'
+  - name: sessions up (gw-a)
+    wait_until: ${status} --up hub --up exit --up term-a --route 10.0.2.0/24=peer:hub
+    node: gw-a
+    timeout: 30
+  - name: sessions up (gw-b)
+    wait_until: ${status} --up hub --up exit --route 10.0.1.0/24=peer:hub
+    node: gw-b
+    timeout: 30
+  - name: sessions up (hub)
+    wait_until: ${status} --up gw-a --up gw-b
+    node: hub
+    timeout: 30
+  - name: links use protocol version 2
+    exec: grep -c '"link session up".*"version":2' ${gw-b.dir}/tunxd.log
+    node: gw-b
+    match: '^2$'
+
+  # LAN A <-> LAN B through the hub. gw-b delivers with the original source
+  # (source: preserve), so host-b sees host-a itself.
+  - name: host-a to host-b TCP (source preserved)
+    exec: ${probe} tcp ${host-b.eth0} 80
+    node: host-a
+    match: '^peer ${host-a.eth0} '
+  - name: host-a to host-b UDP (source preserved)
+    exec: ${probe} udp ${host-b.eth0} 53
+    node: host-a
+    match: '^peer ${host-a.eth0} '
+  - name: host-a pings host-b
+    exec: ping -c 3 -i 0.2 -W 2 ${host-b.eth0}
+    node: host-a
+  - name: host-a to host-b TCP over IPv6 (source preserved)
+    exec: ${probe} tcp ${host-b.eth0.v6} 80
+    node: host-a
+    match: '^peer ${host-a.eth0.v6} '
+  - name: host-a to host-b UDP over IPv6
+    exec: ${probe} udp ${host-b.eth0.v6} 53
+    node: host-a
+    match: '^peer ${host-a.eth0.v6} '
+  - name: host-a pings host-b over IPv6
+    exec: ping -c 3 -i 0.2 -W 2 ${host-b.eth0.v6}
+    node: host-a
+  - name: reverse, host-b to host-a TCP (from gw-a's address)
+    exec: ${probe} tcp ${host-a.eth0} 22
+    node: host-b
+    match: '^peer ${gw-a.eth0} '
+  - name: reverse, host-b to host-a UDP
+    exec: ${probe} udp ${host-a.eth0} 53
+    node: host-b
+    match: '^peer ${gw-a.eth0} '
+  - name: reverse, host-b pings host-a
+    exec: ping -c 3 -i 0.2 -W 2 ${host-a.eth0}
+    node: host-b
+  - name: reverse over IPv6
+    exec: ${probe} tcp ${host-a.eth0.v6} 22
+    node: host-b
+    match: '^peer ${gw-a.eth0.v6} '
+  - name: term-a (terminal node) to host-b keeps its overlay address
+    exec: ${probe} tcp ${host-b.eth0} 22
+    node: term-a
+    match: '^peer 10.200.0.4 '
+  - name: hub to term-a through gw-a
+    exec: ${probe} tcp 10.200.0.4 22 && ${probe} tcp fd74:756e:7800::4 22
+    node: hub
+    match: '^peer fd74:756e:7800::4 '
+  - name: hub to host-a
+    exec: ${probe} tcp ${host-a.eth0} 80
+    node: hub
+    match: '^peer ${gw-a.eth0} '
+
+  # Without the socket-transparent recipe, replies to preserved
+  # sources are routed into the TUN and connections fail.
+  - name: without the preserve recipe TCP UDP and ping fail
+    exec: >-
+      ip netns exec ${gw-b.ns} sh -c 'nft delete table ip tunx; nft delete table ip6 tunx';
+      ${probe} tcp ${host-b.eth0} 80 --timeout 3; a=$$?;
+      ping -c 2 -W 2 ${host-b.eth0} >/dev/null; b=$$?;
+      ${probe} udp ${host-b.eth0} 53 --timeout 3; c=$$?;
+      ip netns exec ${gw-b.ns} nft -f ${gw-b.dir}/preserve.nft;
+      echo "tcp rc=$$a ping rc=$$b udp rc=$$c"
+    node: host-a
+    timeout: 20
+    match: 'tcp rc=1 ping rc=1 udp rc=1'
+  - name: with the recipe restored TCP UDP and ping work again
+    exec: ${probe} tcp ${host-b.eth0} 80 && ${probe} udp ${host-b.eth0} 53 && ping -c 2 -i 0.2 -W 2 ${host-b.eth0}
+    node: host-a
+
+  # Open answers: the delivering node answers after its dial. A refused
+  # connection gives an RST at once; a policy denial and an unreachable
+  # destination stay silent (the client times out).
+  - name: closed port is refused at once (RST)
+    exec: ${probe} tcp ${host-b.eth0} 23 --timeout 5
+    node: host-a
+    rc: 1
+    match: 'Connection refused'
+    timeout: 4
+  - name: policy denial is silent
+    exec: ${probe} tcp ${host-b.eth0} 25 --timeout 4
+    node: host-a
+    rc: 1
+    match: 'timed out'
+  - name: unreachable destination is silent
+    exec: ${probe} tcp 10.0.2.99 80 --timeout 4
+    node: host-a
+    rc: 1
+    match: 'timed out'
+  - name: unreachable destination, ping gets no reply and no ICMP error
+    exec: ping -c 2 -W 2 10.0.2.99
+    node: host-a
+    rc: 1
+    not_match: 'Unreachable|Prohibited'
+  - name: gw-b counted the denial
+    exec: ${status} --drop denied=1
+    node: gw-b
+  - name: gw-a counted the refusals
+    exec: ${status} --drop refused=2
+    node: gw-a
+
+  # gw-a and gw-b capture the hub's prefix, yet their link sockets
+  # stay out of the TUN: gw-a by mark and policy route, gw-b by interface.
+  - name: gw-a routes the hub's address into the TUN
+    exec: ip route get ${hub.eth0}
+    node: gw-a
+    match: 'dev tunx0'
+  - name: gw-a link sockets carry the mark
+    exec: ss -tne state established dport = :4430
+    node: gw-a
+    match: 'fwmark:0x74'
+  - name: gw-b link sockets are bound to eth0
+    exec: ss -tn state established dport = :4430
+    node: gw-b
+    match: '%eth0:'
+  - name: link traffic never enters the TUN (gw-a)
+    exec: >-
+      (timeout 3 tcpdump -ni tunx0 tcp port 4430 2>&1 | sed -n 's/ packets captured/ tun/p') &
+      (timeout 3 tcpdump -ni eth0 tcp port 4430 2>&1 | sed -n 's/ packets captured/ eth0/p') &
+      sleep 0.5; for i in 1 2 3; do ${probe} tcp ${web.eth0} 80 >/dev/null; done; wait
+    node: gw-a
+    match: '(?s)^(?=.*^0 tun$)(?=.*^[1-9][0-9]* eth0$)'
+  - name: link traffic never enters the TUN (gw-b)
+    exec: >-
+      (timeout 3 tcpdump -ni tunx0 tcp port 4430 2>&1 | sed -n 's/ packets captured/ tun/p') &
+      (timeout 3 tcpdump -ni eth0 tcp port 4430 2>&1 | sed -n 's/ packets captured/ eth0/p') &
+      sleep 0.5; for i in 1 2 3; do ${probe} tcp ${web.eth0} 80 >/dev/null; done; wait
+    node: gw-b
+    match: '(?s)^(?=.*^0 tun$)(?=.*^[1-9][0-9]* eth0$)'
+  - name: gw-b reaches the internet through the hub (TCP)
+    exec: ${probe} tcp ${web.eth0} 80
+    node: gw-b
+    match: '^peer ${hub.eth0} '
+  - name: gw-b reaches the internet through the hub (UDP)
+    exec: ${probe} udp ${web.eth0} 53
+    node: gw-b
+    match: '^peer ${hub.eth0} '
+  - name: gw-b reaches the internet through the hub (IPv6)
+    exec: ${probe} tcp ${web.eth0.v6} 80
+    node: gw-b
+    match: '^peer ${hub.eth0.v6} '
+
+  # The hub runs as nobody and pings through ping sockets.
+  - name: ping through the unprivileged hub (IPv4)
+    exec: ping -c 3 -i 0.2 -W 2 ${web.eth0}
+    node: gw-b
+  - name: ping through the unprivileged hub (ICMPv6)
+    exec: ping -c 3 -i 0.2 -W 2 ${web.eth0.v6}
+    node: gw-b
+  - name: without ping_group_range the hub cannot ping
+    exec: >-
+      ip netns exec ${hub.ns} sysctl -qw net.ipv4.ping_group_range="1 0";
+      ping -c 2 -W 2 ${web.eth0} >/dev/null; a=$$?;
+      ping -c 2 -W 2 ${web.eth0.v6} >/dev/null; b=$$?;
+      ip netns exec ${hub.ns} sysctl -qw net.ipv4.ping_group_range="0 2147483647";
+      echo "v4 rc=$$a v6 rc=$$b"
+    node: gw-b
+    match: 'v4 rc=1 v6 rc=1'
+  - name: the hub logs why
+    exec: grep -c 'ping sockets not permitted' ${hub.dir}/tunxd.log
+    node: hub
+    match: '^[1-9]'
+
+  # Failover to exit and back, with loss on the mobile segment.
+  - netem: {loss: 1%}
+    segment: mobile
+  - link: down
+    node: hub
+    if: eth0
+  - name: failover, LAN A reaches LAN B through exit (seconds = recovery time)
+    wait_until: ${probe} tcp ${host-b.eth0} 80 --timeout 1
+    node: host-a
+    timeout: 30
+    interval: 0.2
+    match: '^peer ${host-a.eth0} '
+  - name: failover, gw-a moved to exit
+    exec: ${status} --down hub --route 10.0.2.0/24=peer:exit
+    node: gw-a
+  - name: failover, gw-b moved to exit
+    wait_until: ${status} --down hub --route 10.0.1.0/24=peer:exit
+    node: gw-b
+    timeout: 30
+  - name: failover, reverse direction
+    exec: ${probe} tcp ${host-a.eth0} 22
+    node: host-b
+    match: '^peer ${gw-a.eth0} '
+  - link: up
+    node: hub
+    if: eth0
+  - name: recovery, gw-a back on the hub
+    wait_until: ${status} --up hub --route 10.0.2.0/24=peer:hub
+    node: gw-a
+    timeout: 30
+  - name: recovery, gw-b back on the hub
+    wait_until: ${status} --up hub --route 10.0.1.0/24=peer:hub
+    node: gw-b
+    timeout: 30
+  - netem: reset
+    segment: mobile
+
+  # Link cut mid-flow: a cut shorter than keepalive_timeout is bridged by
+  # TCP; a lost hub ends the flow (no hang) and new flows use exit.
+  - background: exec iperf3 -s -p 5301
+    node: host-a
+  - sleep: 1
+  - background: exec sh -c 'iperf3 -c ${host-a.eth0} -p 5301 -t 15 >iperf-short.out 2>&1; echo "iperf rc=$$?" >>iperf-short.out'
+    node: host-b
+  - sleep: 4
+  - link: down
+    node: router-b
+    if: wan0
+  - sleep: 5
+  - link: up
+    node: router-b
+    if: wan0
+  - name: a 5 s uplink cut mid-flow is bridged
+    wait_until: grep 'iperf rc=' ${host-b.dir}/iperf-short.out
+    node: host-b
+    timeout: 45
+    match: 'iperf rc=0'
+  - background: exec sh -c 'iperf3 -c ${host-a.eth0} -p 5301 -t 60 >iperf-hub.out 2>&1; echo "iperf rc=$$?" >>iperf-hub.out'
+    node: host-b
+  - sleep: 3
+  - link: down
+    node: hub
+    if: eth0
+  - name: losing the hub mid-flow ends the flow (seconds = time to end)
+    wait_until: grep 'iperf rc=' ${host-b.dir}/iperf-hub.out
+    node: host-b
+    timeout: 40
+    match: 'iperf rc=1'
+  - name: new flows go through exit
+    exec: ${probe} tcp ${host-a.eth0} 22
+    node: host-b
+    match: '^peer ${gw-a.eth0} '
+  - link: up
+    node: hub
+    if: eth0
+  - name: hub back for the measurements
+    wait_until: ${status} --up hub --route 10.0.1.0/24=peer:hub
+    node: gw-b
+    timeout: 30
+
+  # A quick throughput and latency check; tunxd-bench.yaml measures
+  # properly (loss rates, congestion control, raw baseline).
+  - {name: "overlay host-b to host-a", measure: iperf3, from: host-b, server: host-a, port: 5201, duration: 5, expect: {mbps_min: 5}}
+  - {name: "overlay host-a to host-b", measure: iperf3, from: host-b, server: host-a, port: 5201, duration: 5, reverse: true, expect: {mbps_min: 5}}
+  - {name: "overlay ping", measure: ping, from: host-b, to: "${host-a.eth0}", count: 20, expect: {avg_rtt_max_ms: 150, loss_max_pct: 0}}
+
+  # SIGTERM with active TUN flows: tunxd exits 0 promptly, logs
+  # "node stopped" and removes the TUN it created.
+  - background: exec sh -c 'iperf3 -c ${host-a.eth0} -p 5301 -t 20 >iperf-term.out 2>&1'
+    node: host-b
+  - sleep: 3
+  - name: SIGTERM gw-a during a flow, exits within 5 s
+    exec: pid=$$(cat ${gw-a.dir}/tunxd.pid); kill -TERM $$pid; for i in $$(seq 50); do kill -0 $$pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1
+    node: gw-a
+  - name: gw-a exited 0 and logged "node stopped"
+    wait_until: grep -q '"node stopped"' ${gw-a.dir}/tunxd.log && grep 'tunxd exited' ${run}/logs/gw-a.log
+    node: gw-a
+    timeout: 5
+    match: 'tunxd exited rc=0'
+  - name: gw-a removed the TUN it created
+    exec: ip link show tunx0
+    node: gw-a
+    rc: nonzero
+  - name: SIGTERM the unprivileged hub
+    exec: pid=$$(cat ${hub.dir}/tunxd.pid); kill -TERM $$pid; for i in $$(seq 50); do kill -0 $$pid 2>/dev/null || exit 0; sleep 0.1; done; exit 1
+    node: hub
+  - name: hub exited 0
+    wait_until: grep 'tunxd exited' ${run}/logs/hub.log
+    node: hub
+    timeout: 5
+    match: 'tunxd exited rc=0'

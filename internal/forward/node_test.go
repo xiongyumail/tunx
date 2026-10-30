@@ -18,6 +18,7 @@ import (
 
 	"github.com/xiongyumail/tunx/internal/config"
 	"github.com/xiongyumail/tunx/internal/core"
+	"github.com/xiongyumail/tunx/internal/egress"
 	"github.com/xiongyumail/tunx/internal/link"
 	"golang.org/x/sys/unix"
 )
@@ -508,5 +509,61 @@ func TestStatusEndpoint(t *testing.T) {
 	}
 	if sel["127.0.1.0/24"] != "peer:b" || sel["127.0.2.0/24"] != "local" {
 		t.Fatalf("routes %+v", st.Routes)
+	}
+}
+
+// An established preferred session may lead to a broken downstream route.
+// Route-dependent answers can use the alternate; terminal answers cannot.
+func TestDownstreamRefusalFallback(t *testing.T) {
+	for _, reason := range []core.Reason{core.ReasonNoRoute, core.ReasonUnreachable, core.ReasonHopLimit, core.ReasonDenied, core.ReasonRefused, core.ReasonError} {
+		t.Run(reason.String(), func(t *testing.T) {
+			k := newKeys(t, "a", "b", "c", "d")
+			rec := newRecorder()
+			bc := baseConfig(k, "b")
+			bc.Peers = []config.Peer{peer(k, "a", ""), peer(k, "d", "")}
+			bc.Routes = []config.Route{localRoute("127.0.4.0/24", "b")}
+			if reason == core.ReasonNoRoute {
+				// The relay is live, but its next hop has no session.
+				bc.Routes = []config.Route{remoteRoute("127.0.4.0/24", config.Advertiser{Node: "d"})}
+			}
+			b := startNode(t, bc, nil, Options{Deliver: func(ctx context.Context, meta core.FlowMeta, f core.Flow, opts egress.Options) error {
+				return core.Refuse(f, reason)
+			}})
+			cc := baseConfig(k, "c")
+			cc.Peers = []config.Peer{peer(k, "a", "")}
+			cc.Routes = []config.Route{localRoute("127.0.4.0/24", "c")}
+			c := startNode(t, cc, rec, Options{})
+			ac := baseConfig(k, "a")
+			ac.Listen = nil
+			ac.Peers = []config.Peer{peer(k, "b", addr(b)), peer(k, "c", addr(c))}
+			ac.Routes = []config.Route{remoteRoute("127.0.4.0/24",
+				config.Advertiser{Node: "d", Via: []string{"b"}, Priority: 1},
+				config.Advertiser{Node: "c", Priority: 2})}
+			a := startNode(t, ac, rec, Options{})
+			waitUp(t, a, "b", "c")
+			srv := newCountServer(t, "127.0.4.1")
+			conn := injectTCP(t, a, srv.addr())
+			defer conn.Close()
+			switch reason {
+			case core.ReasonNoRoute, core.ReasonUnreachable, core.ReasonHopLimit:
+				if got := tcpExchange(t, conn, []byte("ok")); got != "n=2" {
+					t.Fatalf("alternate response %q", got)
+				}
+				if d := rec.next(t); d.node != "c" {
+					t.Fatalf("delivered by %s", d.node)
+				}
+			default:
+				conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				if _, err := conn.Read(make([]byte, 1)); err == nil {
+					t.Fatal("terminal refusal produced data")
+				}
+				if srv.accepted.Load() != 0 {
+					t.Fatal("terminal refusal tried the alternate")
+				}
+			}
+			if !a.Sessions().Up("b") {
+				t.Fatal("preferred relay session went down")
+			}
+		})
 	}
 }

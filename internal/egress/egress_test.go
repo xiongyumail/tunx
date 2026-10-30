@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -219,6 +220,73 @@ func TestTCPDialRefused(t *testing.T) {
 	case <-flow.done:
 	default:
 		t.Fatal("flow not closed")
+	}
+}
+
+// answerFlow records the answer Deliver gives.
+type answerFlow struct {
+	*msgFlow
+	mu       sync.Mutex
+	accepted bool
+	refused  core.Reason
+}
+
+func (f *answerFlow) Accept() error {
+	f.mu.Lock()
+	f.accepted = true
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *answerFlow) Refuse(r core.Reason) error {
+	f.mu.Lock()
+	f.refused = r
+	f.mu.Unlock()
+	return f.Close()
+}
+
+func (f *answerFlow) answer() (bool, core.Reason) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.accepted, f.refused
+}
+
+func TestDeliverAnswers(t *testing.T) {
+	// A closed port: refused with ReasonRefused.
+	ln := listenTCP(t, "tcp4", "127.0.0.1:0")
+	meta := tcpMeta("10.0.0.2:40000", ln)
+	ln.Close()
+	m, _ := msgPipe()
+	f := &answerFlow{msgFlow: m}
+	Deliver(context.Background(), meta, f, Options{})
+	if acc, r := f.answer(); acc || r != core.ReasonRefused {
+		t.Fatalf("closed port: accepted %v, refused %v", acc, r)
+	}
+
+	// An open port: accepted before any data.
+	ln = listenTCP(t, "tcp4", "127.0.0.1:0")
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			c.Close()
+		}
+	}()
+	m, _ = msgPipe()
+	f = &answerFlow{msgFlow: m}
+	Deliver(context.Background(), tcpMeta("10.0.0.2:40000", ln), f, Options{})
+	if acc, r := f.answer(); !acc || r != 0 {
+		t.Fatalf("open port: accepted %v, refused %v", acc, r)
+	}
+
+	for err, want := range map[error]core.Reason{
+		syscall.ECONNREFUSED: core.ReasonRefused,
+		&net.OpError{Op: "dial", Err: syscall.EHOSTUNREACH}: core.ReasonUnreachable,
+		syscall.ENETUNREACH:      core.ReasonUnreachable,
+		context.DeadlineExceeded: core.ReasonUnreachable,
+		ErrPreserveNotPermitted:  core.ReasonError,
+	} {
+		if got := ReasonFor(err); got != want {
+			t.Errorf("ReasonFor(%v) = %v, want %v", err, got, want)
+		}
 	}
 }
 

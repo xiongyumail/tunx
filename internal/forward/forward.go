@@ -26,6 +26,11 @@ type DeliverFunc func(ctx context.Context, meta core.FlowMeta, f core.Flow, opts
 // openTimeout bounds sending a stream header to the next hop.
 const openTimeout = 10 * time.Second
 
+// answerTimeout bounds waiting for the next hop's answer to a TCP flow. It
+// covers the delivering node's connect timeout (egress.DefaultDialTimeout)
+// plus the round trips of the hops in between.
+const answerTimeout = 20 * time.Second
+
 // Forwarder implements core.Handler for a node.
 type Forwarder struct {
 	self     string
@@ -66,6 +71,12 @@ func (fw *Forwarder) Stats() *Stats { return fw.stats }
 func (fw *Forwarder) SetPolicy(p *policy.Policy) { fw.policy.Store(p) }
 
 // HandleFlow routes one flow and returns when it is finished.
+//
+// A flow that waits for an answer (core.Answerer: a TCP connection from the
+// TUN, a flow from a link) is accepted only once the next hop accepted it or
+// the local delivery connected, and refused with the reason otherwise. TCP
+// waits for that answer before data flows. Datagram relays accept once
+// their next-hop stream opens, without confirming downstream delivery.
 func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.Flow, in core.Ingress) {
 	defer f.Close()
 	pol := fw.policy.Load()
@@ -77,17 +88,17 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 		// The peer vouches for the identity; it must be one the peer may
 		// carry, and never our own (that would be a loop or a forgery).
 		if meta.Identity == fw.self || !pol.MayCarry(in.Peer, meta.Identity) {
-			fw.drop(DropSpoofed, meta, in)
+			fw.drop(DropSpoofed, meta, in, f)
 			return
 		}
 	default:
 		if meta.Identity == "" {
-			fw.drop(DropSpoofed, meta, in)
+			fw.drop(DropSpoofed, meta, in, f)
 			return
 		}
 	}
 	if int(meta.Hops) > int(fw.hopLimit) {
-		fw.drop(DropHopLimit, meta, in)
+		fw.drop(DropHopLimit, meta, in, f)
 		return
 	}
 
@@ -95,7 +106,7 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 	if len(next) > 0 && next[0].Local {
 		// Delivering node: the access policy applies here.
 		if !pol.Allow(meta) {
-			fw.drop(DropDenied, meta, in)
+			fw.drop(DropDenied, meta, in, f)
 			return
 		}
 		fw.deliverLocal(ctx, meta, f, in, next[0].Egress)
@@ -103,16 +114,17 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 	}
 	if in.Kind != "link" && !pol.Allow(meta) {
 		// Ingress node: the access policy applies here too.
-		fw.drop(DropDenied, meta, in)
+		fw.drop(DropDenied, meta, in, f)
 		return
 	}
 	if int(meta.Hops)+1 > int(fw.hopLimit) {
-		fw.drop(DropHopLimit, meta, in)
+		fw.drop(DropHopLimit, meta, in, f)
 		return
 	}
 	out := meta
 	out.Hops++
 	tried := false
+	var lastRefusal core.Reason
 	for _, n := range next {
 		if n.Local || n.Peer == in.Peer {
 			continue // never send a flow back over the link it came from
@@ -129,21 +141,69 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 			fw.log.Debug("open flow failed", "peer", n.Peer, "err", err)
 			continue
 		}
+		if !meta.Proto.IsDatagram() {
+			actx, cancel := context.WithTimeout(ctx, answerTimeout)
+			err := link.WaitOpen(actx, of)
+			cancel()
+			var oe *core.OpenError
+			if errors.As(err, &oe) {
+				// Reachability and hop limits depend on the path. Policy,
+				// destination resets and protocol errors remain terminal.
+				of.Close()
+				switch oe.Reason {
+				case core.ReasonNoRoute, core.ReasonUnreachable, core.ReasonHopLimit:
+					lastRefusal = oe.Reason
+					continue
+				}
+				fw.stats.Drop(DropRefused)
+				fw.log.Debug("refused downstream", "reason", oe.Reason, "proto", meta.Proto, "src", meta.Src, "dst", meta.Dst,
+					"identity", meta.Identity, "peer", n.Peer)
+				core.Refuse(f, oe.Reason)
+				return
+			}
+			if err != nil {
+				of.Close()
+				fw.log.Debug("no answer", "peer", n.Peer, "err", err)
+				continue
+			}
+		}
+		if err := core.Accept(f); err != nil {
+			of.Close()
+			return
+		}
 		fw.log.Debug("forward", "proto", meta.Proto, "src", meta.Src, "dst", meta.Dst, "identity", meta.Identity, "hops", out.Hops, "peer", n.Peer, "via_for", n.Advertiser)
 		fw.splice(ctx, meta, f, of, in, n.Peer)
 		return
 	}
-	if !tried {
-		fw.drop(DropNoRoute, meta, in)
+	if lastRefusal != 0 {
+		fw.stats.Drop(DropRefused)
+		core.Refuse(f, lastRefusal)
+	} else if !tried {
+		fw.drop(DropNoRoute, meta, in, f)
 	} else {
-		fw.drop(DropOpenFailed, meta, in)
+		fw.drop(DropOpenFailed, meta, in, f)
 	}
 }
 
-func (fw *Forwarder) drop(reason string, meta core.FlowMeta, in core.Ingress) {
+// dropReasons maps drop counters to the reason sent back to the opener.
+var dropReasons = map[string]core.Reason{
+	DropNoRoute:    core.ReasonNoRoute,
+	DropDenied:     core.ReasonDenied,
+	DropSpoofed:    core.ReasonDenied,
+	DropHopLimit:   core.ReasonHopLimit,
+	DropOpenFailed: core.ReasonUnreachable,
+}
+
+// drop counts and refuses a flow.
+func (fw *Forwarder) drop(reason string, meta core.FlowMeta, in core.Ingress, f core.Flow) {
 	fw.stats.Drop(reason)
 	fw.log.Debug("drop", "reason", reason, "proto", meta.Proto, "src", meta.Src, "dst", meta.Dst,
 		"identity", meta.Identity, "hops", meta.Hops, "ingress", in.Kind, "peer", in.Peer)
+	r, ok := dropReasons[reason]
+	if !ok {
+		r = core.ReasonError
+	}
+	core.Refuse(f, r)
 }
 
 // counters returns the counters one flow updates: forward bytes go to the
@@ -214,6 +274,9 @@ func (c *countingFlow) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (c *countingFlow) Accept() error              { return core.Accept(c.Flow) }
+func (c *countingFlow) Refuse(r core.Reason) error { return core.Refuse(c.Flow, r) }
+
 func (fw *Forwarder) splice(ctx context.Context, meta core.FlowMeta, a, b core.Flow, in core.Ingress, outPeer string) {
 	fwd, back := fw.counters(meta, in, outPeer)
 	Splice(ctx, a, b, meta.Proto.IsDatagram(), fwd, back)
@@ -258,6 +321,13 @@ func copyHalf(dst, src core.Flow, datagram bool, count func(int)) error {
 	buf := *bp
 	for {
 		n, err := src.Read(buf)
+		var oe *core.OpenError
+		if errors.As(err, &oe) {
+			// The far end refused a flow that did not wait for the answer
+			// (a datagram flow): pass the refusal on.
+			core.Refuse(dst, oe.Reason)
+			return err
+		}
 		if err == nil || (n > 0 && !datagram) {
 			if n > 0 || datagram {
 				if _, werr := dst.Write(buf[:n]); werr != nil {

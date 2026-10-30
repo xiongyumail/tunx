@@ -3,8 +3,11 @@ package forward
 import (
 	"bytes"
 	"context"
+	"io"
+	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,5 +158,86 @@ func TestTUNToRemoteNode(t *testing.T) {
 	if c, err := gonet.DialContextTCP(ctx2, hs, overlay(netip.MustParseAddrPort("127.0.9.1:80")), ipv4.ProtocolNumber); err == nil {
 		c.Close()
 		t.Fatal("connected to an unroutable destination")
+	}
+}
+
+// The TCP handshake from the TUN completes only after the delivering node,
+// two links away, connected to the destination. A destination that resets
+// the connection resets the client; one denied by the delivering node's
+// policy, or unreachable, leaves the SYN unanswered.
+func TestTUNOpenAnswer(t *testing.T) {
+	k := newKeys(t, "a", "b", "c")
+	rec := newRecorder()
+
+	open := newCountServer(t, "127.0.3.1")
+	denied := newCountServer(t, "127.0.3.2")
+	ln, err := net.Listen("tcp4", "127.0.3.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := ln.Addr().(*net.TCPAddr).AddrPort()
+	ln.Close()
+
+	bc := baseConfig(k, "b")
+	bc.Peers = []config.Peer{peer(k, "a", ""), peer(k, "c", "")}
+	bc.Routes = []config.Route{remoteRoute("198.18.3.0/24", config.Advertiser{Node: "c"})}
+	b := startNode(t, bc, rec, Options{})
+
+	cc := baseConfig(k, "c")
+	cc.Listen = nil
+	cc.Peers = []config.Peer{peer(k, "b", addr(b), "a")}
+	cc.Routes = []config.Route{localRoute("198.18.3.0/24", "c")}
+	cc.Policy = []config.Rule{
+		{Action: "deny", Dst: []netip.Prefix{netip.MustParsePrefix("198.18.3.2/32")}},
+		{Action: "allow"},
+	}
+	c := startNode(t, cc, rec, Options{})
+
+	tunEP := channel.New(512, 1500, "")
+	ac := baseConfig(k, "a")
+	ac.Listen = nil
+	ac.Peers = []config.Peer{peer(k, "b", addr(b))}
+	ac.Routes = []config.Route{remoteRoute("198.18.3.0/24", config.Advertiser{Node: "c", Via: []string{"b"}})}
+	a := startNode(t, ac, rec, Options{Endpoint: tunEP})
+	waitUp(t, a, "b")
+	waitUp(t, c, "b")
+	hs := hostStack(t, tunEP)
+
+	dial := func(dst netip.AddrPort, d time.Duration) (*gonet.TCPConn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		return gonet.DialContextTCP(ctx, hs, overlay(dst), ipv4.ProtocolNumber)
+	}
+
+	conn, err := dial(open.addr(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("open destination: %v", err)
+	}
+	conn.Write([]byte("abc"))
+	conn.CloseWrite()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if got, _ := io.ReadAll(conn); string(got) != "n=3" {
+		t.Fatalf("open destination answered %q", got)
+	}
+	conn.Close()
+
+	start := time.Now()
+	if _, err := dial(closed, 5*time.Second); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("closed port: %v, want connection refused", err)
+	} else if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("closed port refused after %v", d)
+	}
+
+	if conn, err := dial(denied.addr(), 700*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("connected to a denied destination")
+	} else if strings.Contains(err.Error(), "refused") {
+		t.Fatalf("denied destination: %v, want no answer", err)
+	}
+	if n := denied.accepted.Load(); n != 0 {
+		t.Fatalf("denied server saw %d connections", n)
+	}
+	if c.Forwarder().Stats().Drops(DropDenied) == 0 || a.Forwarder().Stats().Drops(DropRefused) < 2 {
+		t.Fatalf("drops: c %v, a %v", c.Status().Stats.Drops, a.Status().Stats.Drops)
 	}
 }

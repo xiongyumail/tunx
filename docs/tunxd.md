@@ -40,17 +40,28 @@ Build: `go build -o tunxd ./cmd/tunxd`.
    A flow is never sent back over the link it arrived on. When the longest
    match has no reachable advertiser the flow is refused (`no_route`); a
    shorter prefix is never used as a fallback, so a site whose exit is down
-   is cut off rather than sent elsewhere.
+   is cut off rather than sent elsewhere. For TCP, `no_route`, `unreachable`
+   and `hop_limit` from a live peer also try the next candidate; policy
+   denials, destination resets and generic errors remain terminal.
 4. **Policy.** The access policy is checked at the ingress node (flows from
    the TUN) and at the delivering node. Relays only do the identity check of
    step 1.
 5. **Data.** The flow is opened on the next hop with `Hops + 1` and spliced
    both ways: TCP keeps half-close, UDP and ICMP keep message boundaries.
 
-A refused flow is closed without any data. For TCP from the TUN the SYN goes
-unanswered; ping gets no reply. Nothing is faked.
+A TCP connection from the TUN is completed only after the delivering node
+has connected to the destination: each hop answers the flow open with OK or
+a refusal reason (protocol version 2, see `docs/protocol.md`). The client
+gets an RST when the destination refused the connection (`refused`); every
+other refusal (`denied`, `no_route`, `hop_limit`, unreachable, error) is
+silent, so the SYN goes unanswered and the client times out, as through a
+firewall that drops. UDP and ping do not wait for the answer. A relay
+accepts upstream when its next-hop stream opens; that hop-local acceptance
+does not confirm delivery. A downstream refusal closes the flow, but its
+reason may not propagate after acceptance. A refused ping gets no reply. Nothing is faked: no
+ICMP errors are generated.
 
-When an advertiser's session ends (closed, or no pong for
+When an advertiser's session ends (closed, or no transport bytes received for
 `keepalive_timeout`), new flows move to the next advertiser at once. Flows
 that were open on the dead session end.
 
@@ -73,6 +84,7 @@ JSON; `//` and `/* */` comments are allowed, unknown fields are errors. See
 | `peers[].name`, `public_key` | A node this node links with |
 | `peers[].dial` | Address to dial (normally a local Xray inbound wired to the peer); empty: the peer dials us |
 | `peers[].interface`, `mark` | `SO_BINDTODEVICE` / `SO_MARK` on the dialing socket |
+| `peers[].congestion`, `listen[].congestion` | TCP congestion control of the link socket (`bbr`, `cubic`, ...; default: the system's). Use it when tunxd's own link socket crosses the lossy path; behind Xray set `sockopt.tcpcongestion` in Xray instead. BBR must already be available on the test host |
 | `peers[].priority` | Order for `via: ["*"]`, lower first |
 | `peers[].relay_for` | Identities (patterns or `@group`) this peer may carry besides its own name |
 | `routes[].prefix` | Destination prefix, without host bits |
@@ -80,7 +92,7 @@ JSON; `//` and `/* */` comments are allowed, unknown fields are errors. See
 | `groups` | Named lists of identity patterns, referenced as `@name` |
 | `policy[]` | Rules: `action` (`allow`/`deny`), `identity`, `src`, `dst`, `proto` (`tcp`, `udp`, `icmp`, `any`), `ports` (`22`, `"8000-8999"`). Empty fields match anything; first match wins; no match denies |
 | `hop_limit` | Maximum links a flow may cross, default 8 |
-| `link` | `handshake_timeout`, `keepalive_interval`, `keepalive_timeout` (`"5s"`) |
+| `link` | `handshake_timeout`, `keepalive_interval`, `keepalive_timeout` (`"5s"`); `stream_buffer`: per-flow window in bytes (default 4 MiB, about 200 Mbit/s for one flow at 80 ms RTT; smaller bounds how much one bulk flow queues ahead of others on a slow link) |
 | `status` | Loopback address of the status endpoint; empty disables it |
 | `log_level` | `debug`, `info` (default), `warn`, `error` |
 
@@ -96,7 +108,8 @@ Identity patterns use shell glob syntax (`site-*`).
 - `stats`: flows and bytes per identity and per peer (`tx` toward the
   destination for an identity, toward the peer for a peer), and refused flows
   by reason (`no_route`, `denied`, `hop_limit`, `spoofed`, `open_failed`,
-  `deliver_failed`).
+  `deliver_failed`, and `refused`: the next hop answered the open with a
+  refusal).
 
 ## Host setup
 
@@ -126,15 +139,34 @@ Run them after tunxd has created the device (or create it first with
   routed into the TUN:
 
   ```
-  nft add table ip tunx
-  nft add chain ip tunx pre '{ type filter hook prerouting priority mangle; }'
-  nft add rule ip tunx pre socket transparent 1 meta mark set 0x7478
+  table ip tunx {
+    chain pre {
+      type filter hook prerouting priority mangle; policy accept;
+      socket transparent 1 meta mark set 0x7478
+      iifname != "tunx0" ip daddr { 10.0.1.0/24 } icmp type echo-reply meta mark set 0x7478
+    }
+  }
+  ```
+
+  ```
   ip rule add fwmark 0x7478 lookup 7478
   ip route add local 0.0.0.0/0 dev lo table 7478
   ```
 
-  (and the same for IPv6 with `ip6` / `ip -6`). This recipe is still to be
-  verified in the simulation.
+  and the same for IPv6 (`table ip6`, `ip6 daddr`, `icmpv6 type
+  echo-reply`, `ip -6`). The `socket` match covers TCP and UDP. It does not
+  find ping sockets, so echo replies addressed to the preserved sources (the
+  remote prefixes in the set) need the second rule. Verified in the
+  scenarios (`tests/sim/scenarios/tunxd-*.yaml`) include negative TCP, UDP
+  and ping checks without this table; remote verification is pending.
+- Lossy uplinks: all flows to a peer share one TCP connection. Congestion
+  control and the stream window affect throughput and queued latency.
+  `tunxd-bench` compares CUBIC and BBR with concurrent ping under load. On
+  the pve-test loss profile, CUBIC became unusable at 1–3% loss; configure
+  BBR for such links when the host provides it. Focused BBR runs completed
+  all 18 samples for both plain and Reality links: about 115 Mbit/s at 1%
+  loss and 56–66 Mbit/s at 3% loss. These are test-VM observations, not
+  capacity guarantees for other networks.
 - Link traffic must not enter the TUN: dial through the local Xray, or bind
   the peer's dialing socket with `interface` / `mark` and policy routing.
 
@@ -144,5 +176,15 @@ Run them after tunxd has created the device (or create it first with
 nodes in one process, linked over loopback TCP, with the TUN of a node
 replaced by a gVisor channel endpoint, and covers TCP, UDP and ping across a
 link, the reverse direction, a relay, policy, identity spoofing, advertiser
-failover and the hop limit. Tests that need root use the build tag
-`tunxroot`; the network simulation is in `tests/sim`.
+failover, the hop limit and open answers. Tests that need root use the
+build tag `tunxroot`.
+
+End to end, `tests/sim/run-tunxd.sh` builds tunxd and runs the scenarios
+`tunxd-plain` (plain TCP links) and `tunxd-xray` (links through Xray, VLESS
++ Reality across a censor) in a disposable VM with network namespaces: TUN
+setup, both directions between two sites, IPv6, `source: preserve`, open
+answers, link sockets kept out of the TUN, an unprivileged node pinging
+through ping sockets, failover and recovery, link cuts during a flow,
+SIGTERM. A separate benchmark covers throughput and latency at 0, 1 and
+3% loss. The current changes passed 88/88 plain and 94/94 Xray scenario
+steps on pve-test. See `tests/sim/README.md`.

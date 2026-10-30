@@ -12,9 +12,13 @@ import (
 
 // Protocol versions this implementation speaks.
 const (
-	ProtocolVersion uint8 = 1
+	ProtocolVersion uint8 = 2
 	minVersion      uint8 = 1
 )
+
+// versionAnswer is the first version in which the acceptor of a flow answers
+// whether it opened (docs/protocol.md, "Open answer").
+const versionAnswer uint8 = 2
 
 const (
 	magic           = "TUNX"
@@ -98,7 +102,7 @@ func signedMessage(label string, th []byte) []byte {
 // clientHandshake runs the dialing side. It returns the peer name and the
 // negotiated version.
 func clientHandshake(rw io.ReadWriter, cfg *Config) (string, uint8, error) {
-	ch := hello{version: ProtocolVersion, network: cfg.Network, name: cfg.Name}
+	ch := hello{version: cfg.highest(), network: cfg.Network, name: cfg.Name}
 	rand.Read(ch.nonce[:])
 	chBytes := ch.encode(true)
 	if err := writeMsg(rw, chBytes); err != nil {
@@ -120,7 +124,7 @@ func clientHandshake(rw io.ReadWriter, cfg *Config) (string, uint8, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	if sh.version < minVersion || sh.version > ProtocolVersion {
+	if sh.version < minVersion || sh.version > cfg.highest() {
 		return "", 0, ErrVersion
 	}
 	key, ok := cfg.Peers[sh.name]
@@ -155,7 +159,7 @@ func serverHandshake(rw io.ReadWriter, cfg *Config) (string, uint8, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	version := min(ch.version, ProtocolVersion)
+	version := min(ch.version, cfg.highest())
 	if version < minVersion {
 		return "", 0, ErrVersion
 	}

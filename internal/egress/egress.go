@@ -88,6 +88,8 @@ var ErrPingNotPermitted = errors.New("egress: ping sockets not permitted (net.ip
 
 // Deliver sends flow f to meta.Dst from this host and pumps data both ways
 // until either side finishes, the flow idles out, or ctx is cancelled. It
+// accepts f (core.Accept) once the socket toward the destination is
+// connected, refuses it (core.Refuse, see ReasonFor) when that fails, and
 // always closes f.
 func Deliver(ctx context.Context, meta core.FlowMeta, f core.Flow, opts Options) error {
 	defer f.Close()
@@ -96,19 +98,45 @@ func Deliver(ctx context.Context, meta core.FlowMeta, f core.Flow, opts Options)
 	case core.ProtoTCP:
 		c, err := DialTCP(ctx, meta, opts)
 		if err != nil {
+			core.Refuse(f, ReasonFor(err))
+			return err
+		}
+		if err := core.Accept(f); err != nil {
+			c.Close()
 			return err
 		}
 		return pumpStream(ctx, f, c)
 	case core.ProtoUDP:
 		c, err := DialUDP(ctx, meta, opts)
 		if err != nil {
+			core.Refuse(f, ReasonFor(err))
+			return err
+		}
+		if err := core.Accept(f); err != nil {
+			c.Close()
 			return err
 		}
 		return pumpDatagram(ctx, f, c, opts.IdleTimeout)
 	case core.ProtoICMP, core.ProtoICMPv6:
 		return deliverEcho(ctx, meta, f, opts)
 	}
+	core.Refuse(f, core.ReasonError)
 	return fmt.Errorf("egress: unsupported protocol %v", meta.Proto)
+}
+
+// ReasonFor maps a delivery error to the reason a flow is refused with:
+// a reset from the destination is core.ReasonRefused, an unreachable
+// destination or a connect timeout core.ReasonUnreachable, anything else
+// core.ReasonError.
+func ReasonFor(err error) core.Reason {
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return core.ReasonRefused
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH),
+		errors.Is(err, syscall.ETIMEDOUT), isTimeout(err):
+		return core.ReasonUnreachable
+	}
+	return core.ReasonError
 }
 
 // DialTCP connects to meta.Dst.

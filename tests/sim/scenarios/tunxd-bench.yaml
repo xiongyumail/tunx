@@ -1,0 +1,67 @@
+# Throughput and latency of the overlay across the mobile segment at several
+# loss rates, for one link setup (plain TCP links or Xray, congestion
+# control of the link sockets), optionally with the raw TCP baseline.
+#
+#   sudo python3 sim.py run topologies/two-sites-tunxd.yaml scenarios/tunxd-bench.yaml \
+#        --set mode=xray --set congestion=bbr --set label=reality-bbr
+#   ... --set mode=plain --set congestion=cubic --set label=plain-cubic --set bench="--raw"
+#
+# Results: RUNDIR/results/bench-LABEL.json (see tunxd/bench.py).
+
+name: tunxd-bench
+
+vars:
+  tunxd: ${sim}/../../bin/tunxd
+  xray: ${sim}/../../bin/xray
+  mode: plain
+  congestion: cubic
+  label: plain
+  bench: ""
+  status: python3 ${sim}/tunxd/status.py
+  gen: python3 ${sim}/tunxd/gen.py --topo ${topo}/two-sites-tunxd.yaml --prefix ${prefix} --rundir ${run}
+
+steps:
+  - name: generate configs
+    exec: ${gen} --mode ${mode} --tunxd ${tunxd} --xray ${xray} --congestion "${congestion}"
+    node: hub
+  - background: exec sh start.sh
+    node: hub
+  - background: exec sh start.sh
+    node: exit
+  - background: exec sh start.sh
+    node: gw-a
+  - background: exec sh start.sh
+    node: gw-b
+  - background: exec sh start.sh
+    node: term-a
+  - wait_until: ip link show tunx0
+    node: gw-a
+    timeout: 10
+  - wait_until: ip link show tunx0
+    node: gw-b
+    timeout: 10
+  - wait_until: ip link show tunx0
+    node: hub
+    timeout: 10
+  - exec: sh ${gw-a.dir}/setup-tun.sh
+    node: gw-a
+  - exec: sh ${gw-b.dir}/setup-tun.sh
+    node: gw-b
+  - exec: sh ${hub.dir}/setup-tun.sh
+    node: hub
+  - name: sessions up
+    wait_until: ${status} --up hub --route 10.0.1.0/24=peer:hub
+    node: gw-b
+    timeout: 30
+  - name: overlay works
+    wait_until: python3 ${sim}/probe.py tcp ${host-a.eth0} 22
+    node: host-b
+    timeout: 10
+  - name: link sockets use the congestion control
+    exec: ss -tni state established '( dport = :443 or dport = :4430 )'
+    node: gw-b
+    match: '${congestion}'
+  - name: bench ${label}
+    exec: python3 ${sim}/tunxd/bench.py --topo ${topo}/two-sites-tunxd.yaml --prefix ${prefix} --rundir ${run} --label ${label} ${bench}
+    node: hub
+    timeout: 3600

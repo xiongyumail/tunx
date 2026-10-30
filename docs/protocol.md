@@ -1,7 +1,13 @@
 # tunx link protocol
 
-This is the wire format of a link session between two tunxd nodes, version 1.
-The implementation is `internal/link`.
+This is the wire format of a link session between two tunxd nodes, version 2.
+The implementation is `internal/link`, which also speaks version 1 with an
+older peer.
+
+| Version | Change |
+|:--|:--|
+| 1 | Initial version |
+| 2 | Open answer: the acceptor of a flow answers whether it opened (section 3) |
 
 A session runs over one reliable, ordered byte stream (`net.Conn`). In
 production that is a connection through Xray (VLESS + Reality, TLS, plain
@@ -32,12 +38,12 @@ client                                          server
 | Field | Size | Contents |
 |:--|:--|:--|
 | magic | 4 | `TUNX` |
-| version | 1 | highest protocol version the client speaks |
+| version | 1 | highest protocol version the client speaks (2) |
 | network | str8 | network ID, at most 64 bytes |
 | name | str8 | client node name, 1..64 bytes |
 | nonce | 32 | fresh random bytes |
 | ext_len | 2 | length of extensions, at most 1024 |
-| extensions | ext_len | see below; empty in version 1 |
+| extensions | ext_len | see below; empty in versions 1 and 2 |
 
 The server closes the connection without a reply when the magic is wrong,
 the network ID differs from its own, the name is not in its peer list, or no
@@ -95,8 +101,8 @@ written by the handshake, so no handshake bytes are buffered past it.
 
 The extension block is a sequence of `type(2) len(2) data(len)` entries.
 Unknown types are ignored. Because the blocks are inside `T`, an extension
-cannot be stripped or altered without breaking the signatures. Version 1
-defines none.
+cannot be stripped or altered without breaking the signatures. Versions 1
+and 2 define none.
 
 ### Version negotiation
 
@@ -111,7 +117,9 @@ chosen version.
 After Accept both sides run [smux](https://github.com/xtaci/smux) protocol
 version 2 (per-stream flow control) on the connection, with smux keepalive
 disabled (the control stream does it), a maximum frame size of 32768 bytes,
-and by default a 16 MiB session receive buffer and a 1 MiB per-stream buffer.
+and by default a 16 MiB session receive buffer and a 4 MiB per-stream buffer
+(the per-flow window: about half of it is in flight, so it bounds one
+flow to about buffer / 2 / RTT).
 smux uses odd stream IDs for the client and even for the server, so both may
 open streams without coordination.
 
@@ -155,8 +163,50 @@ port is 0.
 Receivers ignore bytes after the known fields, so later versions can append
 fields without a new header version.
 
-There is no reply to the header. The acceptor's handler accepts the flow by
-using it and refuses it by closing it.
+### Open answer (version 2)
+
+The acceptor of a flow stream answers once, with a single byte that precedes
+everything else it writes on the stream:
+
+| Value | Meaning | Sent when |
+|:--|:--|:--|
+| 0 | open | TCP: the delivering socket connected or the next hop accepted; datagrams: the local socket or next-hop stream opened (hop-local) |
+| 1 | error | anything else; also implied when the stream ends before an answer |
+| 2 | refused | the destination refused the connection (TCP reset, `ECONNREFUSED`) |
+| 3 | unreachable | destination host or network unreachable, or the connect timed out |
+| 4 | denied | the access policy (or the identity check) refused the flow |
+| 5 | no_route | no advertiser of the destination is reachable |
+| 6 | hop_limit | the flow would cross more links than allowed |
+
+Unknown values are treated like 1. After a refusal the acceptor closes the
+stream (smux FIN) without writing anything else; data the opener sent ahead
+is discarded. Writing data implies the answer open, so an acceptor that
+writes before answering sends the 0 byte first.
+
+The opener may write right after the header, before the answer. Its first
+read returns the answer: data follows an open answer, a refusal ends the
+flow. For TCP, a relay waits for the next hop before accepting upstream.
+It may try another route after `no_route`, `unreachable` or `hop_limit`; policy
+denials, destination resets and generic errors are terminal.
+
+How nodes use it:
+
+- **TCP**: the ingress node holds the client's SYN until the answer arrives
+  (it waits at most 20 s, then treats the flow as unanswered). Open completes
+  the handshake; `refused` answers the SYN with RST, like the destination
+  did; every other refusal leaves the SYN unanswered, so an unreachable or
+  denied destination looks like a silent one and nothing is faked (the
+  capture stack's `TCPRejectWithReset` option turns every refusal into RST). Without the
+  answer the client would see a connection that opens and then closes.
+- **Datagrams** (UDP, ICMP): the opener does not wait; the first datagrams
+  travel with the header. A relay accepts upstream after opening its next-hop
+  stream, before that hop answers. Acceptance is hop-local and does not
+  confirm destination delivery or downstream policy approval. A later
+  downstream refusal closes the relayed flow; its reason may not propagate
+  upstream after acceptance. New datagrams may start a new flow.
+
+In version 1 there is no answer: the acceptor accepts a flow by using it and
+refuses it by closing it, and the opener's reads start with data.
 
 ## 4. Flow framing
 
@@ -217,12 +267,22 @@ On the control stream, in both directions:
 | 0x03–0x0F | reserved for the link layer; ignored |
 | 0x10–0xFF | application messages (route updates and the like), opaque to the link |
 
-Each side sends a ping every keepalive interval (default 5 s) and answers
-every ping with a pong. The timestamp in a pong measures the round-trip time,
-smoothed as `srtt = 7/8 srtt + 1/8 sample`. A side that has received no pong
-for the keepalive timeout (default 15 s) closes the session. With the
-defaults a dead path is detected within about 17 s, which leaves time to
-redial inside the 30 s recovery target.
+Each side sends a ping every keepalive interval (default 5 s). One pong
+responder writes at most one response at a time and holds one pending
+payload, bounded by the control-message size limit. Further pending ping
+requests are dropped, so a blocked pong write does not itself block the
+control reader or start more responder goroutines. Control framing and
+the echoed payload are unchanged.
+
+The timestamp in a pong measures round-trip time, smoothed as
+`srtt = 7/8 srtt + 1/8 sample`. Liveness uses positive-byte reads from the
+underlying transport after authentication, including data and control
+traffic. Writes, queued work, timers and application reads from smux's
+buffers do not refresh it. No received bytes for `keepalive_timeout`
+(default 15 s) closes the session. Checks run every
+`max(keepalive_timeout / 8, 1 ms)`, so detection takes at most one timeout
+plus one check interval and scheduler delay after the last transport read
+(about 17 s with the defaults).
 
 A violation of the control framing closes the session.
 
@@ -256,6 +316,9 @@ exponentially from 250 ms up to 10 s, each wait drawn uniformly from
   clear and the server signs a hello for any client whose name and network
   are known, before the client has proven anything. The transport hides
   this from observers, and Xray admits only its own users.
+- **Open answer.** Relays pass the answer on like flow data and could alter
+  it as they could alter the data, so it is as trustworthy as the relays on
+  the path.
 - **Resource limits.** Handshake messages are capped at 2048 bytes, stream
   headers at 1024, control messages at 1 MiB, datagrams at 65535. Handshake
   and stream headers have deadlines. Flows the peer opens wait until the

@@ -2,16 +2,20 @@
 """Self-test for the simulator. Needs no root: it only parses files and checks plans."""
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import unittest
+import zipfile
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -576,6 +580,602 @@ class TestFakeRoot(unittest.TestCase):
         self.assertEqual(calls[k + 1:k + 3], ["ip -n ts-router-b addr replace 100.64.0.2/24 dev wan0",
                                               "ip -n ts-router-b route replace default via 100.64.0.1 dev wan0"])
         self.assertEqual(self.ns(), [])  # torn down afterwards
+
+
+class TestTunxdBench(unittest.TestCase):
+    def setUp(self):
+        from tunxd import bench
+        self.b = bench
+
+    @staticmethod
+    def interval(begin, end, omitted=False, size=1500000, seconds=None):
+        return {"start": begin, "end": end, "seconds": end - begin if seconds is None else seconds,
+                "bytes": size, "omitted": omitted}
+
+    @staticmethod
+    def ping_output(sent, received):
+        return "\n".join(["64 bytes: time=10.1 ms"] * received +
+                         [f"{sent} packets transmitted, {received} received, 0% packet loss"])
+
+    def document(self, intervals, duration=30):
+        return "\n".join(json.dumps(event) for event in [
+            {"event": "start", "data": {"test_start": {"omit": 3, "duration": duration, "interval": 1}}},
+            *[{"event": "interval", "data": {"sum": value}} for value in intervals],
+            {"event": "end", "data": {"sum_received": {"bits_per_second": 12000000, "seconds": duration}}}])
+
+    def sample(self, intervals=None):
+        if intervals is None:
+            intervals = [self.interval(x, x + 1, True) for x in range(3)] + [self.interval(x, x + 1) for x in range(30)]
+        _, warnings = self.b.normalize_intervals(intervals)
+        timing = {"warmup_s": 3, "launched_s": 100, "test_start_s": 101, "transfer_evidence_s": 102,
+                  "ping_start_s": 105, "ping_end_s": 116, "exit_s": 135,
+                  "transfer_index": 0, "transfer_interval": intervals[0]}
+        schedule = self.b.ping_schedule(timing, 30, 1, timing["ping_start_s"])
+        count = schedule["count"]
+        ping = self.ping_output(count, count)
+        return {"overlapped": True, "iperf_rc": 0, "iperf_stdout": self.document(intervals),
+                "ping_rc": 0, "ping_stdout": ping, "ping_expected": count,
+                "mbps": 12, "loaded": self.b.ping_result(0, ping, count, 20), "intervals": intervals,
+                "interval_warnings": warnings, "timings": timing, "schedule": schedule}
+
+    def fixture(self):
+        sample = self.sample()
+        ping = self.ping_output(30, 30)
+        cell = {"idle": {"rc": 0, "stdout": ping, "expected": 30, "summary": self.b.ping_result(0, ping, 30)},
+                "up": {"median_mbps": 12, "runs": [sample]},
+                "down": {"median_mbps": 12, "runs": [copy.deepcopy(sample)]}}
+        return {"complete": True, "repeat": 1, "duration_s": 30, "report_interval_s": 1,
+                "expected_losses": ["0%"], "expected_kinds": ["overlay"], "loss": {"0%": {"overlay": cell}}}
+
+    def test_default_tunxd_scenarios_load(self):
+        t = model.load(os.path.join(HERE, "topologies", "two-sites-tunxd.yaml"))
+        for name in ("tunxd-plain", "tunxd-xray", "tunxd-bench"):
+            s = scenario.load(os.path.join(HERE, "scenarios", name + ".yaml"), t)
+            self.assertTrue(s.steps)
+        self.assertEqual(s.vars["label"], "plain")
+
+    def test_default_duration_and_explicit_duration(self):
+        for extra, duration in (([], 30), (["--duration", "15"], 15)):
+            with mock.patch.object(sys, "argv", ["bench.py", "--label", "test", *extra]), \
+                    mock.patch.object(self.b, "Bench") as bench:
+                bench.return_value.run.return_value = 0
+                self.assertEqual(self.b.main(), 0)
+                self.assertEqual(bench.call_args.args[0].duration, duration)
+
+    def test_iperf_rejects_failure_and_missing_receiver(self):
+        valid = self.sample()["iperf_stdout"]
+        self.assertEqual(self.b.throughput(0, valid), 12)
+        for rc, doc in ((1, valid), (0, '{}'), (0, '{"error":"failed"}'),
+                        (0, valid.replace('12000000', 'NaN')), (0, 'garbage ' + valid)):
+            with self.subTest(rc=rc, doc=doc), self.assertRaises((ValueError, KeyError)):
+                self.b.throughput(rc, doc)
+
+    def test_ping_requires_rtt_and_packet_counts(self):
+        ping = "64 bytes: time=10.1 ms\n64 bytes: time=12.2 ms\n2 packets transmitted, 2 received, 0% packet loss"
+        summary = self.b.ping_result(0, ping, 2)
+        self.assertEqual(summary["p95_ms"], 12.2)
+        self.assertEqual(summary["loss_pct"], 0)
+        for rc, text, count in ((2, ping, 2), (0, ping, 3), (0, "2 packets transmitted, 0 received", 2)):
+            with self.assertRaises(ValueError):
+                self.b.ping_result(rc, text, count)
+
+    def test_matrix_rejects_incomplete_failed_or_nonconcurrent_runs(self):
+        self.b.validate(self.fixture())
+        mutations = [lambda d: d.update(complete=False), lambda d: d["loss"].clear(),
+                     lambda d: d["loss"]["0%"].clear(),
+                     lambda d: d["loss"]["0%"]["overlay"]["up"].update(runs=[]),
+                     lambda d: d["loss"]["0%"]["overlay"]["up"].update(median_mbps=None),
+                     lambda d: d["loss"]["0%"]["overlay"]["up"]["runs"][0].update(iperf_rc=1),
+                     lambda d: d["loss"]["0%"]["overlay"]["up"]["runs"][0].update(overlapped=False)]
+        for mutate in mutations:
+            d = self.fixture()
+            mutate(d)
+            with self.assertRaises(ValueError):
+                self.b.validate(d)
+
+    def test_preserved_reversed_and_inconsistent_boundary_with_later_coverage(self):
+        for boundary, reason in ((self.interval(3.0001, 0.0002, seconds=0.001), "reversed or empty interval"),
+                                 (self.interval(0.0002, 1.0002, seconds=0.0002), "duration inconsistent with timestamps"),
+                                 (self.interval(0, 0, seconds=0), "reversed or empty interval")):
+            intervals = self.sample()["intervals"]
+            intervals[3] = boundary
+            original = copy.deepcopy(intervals)
+            sample = self.sample(intervals)
+            self.assertEqual(sample["interval_warnings"], [{"index": 3, "reason": reason}])
+            self.assertEqual(sample["intervals"], original)
+            self.assertEqual(self.b.iperf_document(sample["iperf_stdout"])["intervals"][3]["sum"], boundary)
+            self.assertTrue(self.b.loaded_overlap(sample))
+
+    def test_negative_timestamps_are_fatal_before_boundary_exclusion(self):
+        for index in (0, 3, 10):
+            for key in ("start", "end"):
+                with self.subTest(index=index, key=key):
+                    intervals = self.sample()["intervals"]
+                    intervals[index][key] = -.25
+                    warnings = []
+                    with self.assertRaisesRegex(ValueError, "negative interval timestamp"):
+                        self.b.normalize_intervals(intervals, warnings)
+                    self.assertEqual(warnings, [])
+
+    def test_persisted_complete_matrix_rejects_negative_boundary_timestamps(self):
+        cases = [(self.interval(-.25, .75), []),
+                 (self.interval(0, -.25, seconds=.01),
+                  [{"index": 3, "reason": "reversed or empty interval"}])]
+        for direction in ("up", "down"):
+            for boundary, warnings in cases:
+                with self.subTest(direction=direction, boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                    matrix = self.fixture()
+                    sample = matrix["loss"]["0%"]["overlay"][direction]["runs"][0]
+                    sample["intervals"][3] = boundary
+                    sample["interval_warnings"] = warnings
+                    sample["iperf_stdout"] = self.document(sample["intervals"])
+                    path = os.path.join(directory, "bench.json")
+                    with open(path, "w") as f:
+                        json.dump(matrix, f)
+                    with open(path) as f:
+                        persisted = json.load(f)
+                    self.assertTrue(persisted["complete"])
+                    with self.assertRaisesRegex(ValueError, "negative interval timestamp"):
+                        self.b.validate(persisted)
+
+    def test_malformed_interior_repeated_exclusion_and_order_fail(self):
+        cases = []
+        base = self.sample()["intervals"]
+        for index, key, value in ((10, "seconds", .01), (10, "bytes", -1), (10, "omitted", "false"),
+                                  (3, "start", float("nan")), (3, "seconds", float("inf"))):
+            intervals = copy.deepcopy(base)
+            intervals[index][key] = value
+            cases.append(intervals)
+        repeated = copy.deepcopy(base)
+        repeated[3] = self.interval(3, 0, seconds=.01)
+        repeated[4] = self.interval(1, 2, seconds=.01)
+        cases.append(repeated)
+        overlap = copy.deepcopy(base)
+        overlap[10] = self.interval(6.5, 7.5)
+        cases.append(overlap)
+        reorder = copy.deepcopy(base)
+        reorder[10], reorder[11] = reorder[11], reorder[10]
+        cases.append(reorder)
+        for intervals in cases:
+            with self.subTest(intervals=intervals), self.assertRaises(ValueError):
+                self.b.normalize_intervals(intervals)
+
+    def test_duration_tolerance(self):
+        self.b.normalize_intervals([self.interval(0, 1, seconds=1.0009)])
+        self.b.normalize_intervals([self.interval(0, 5, seconds=5.0049)])
+        for interval in (self.interval(0, 1, seconds=1.0011), self.interval(0, 5, seconds=5.0051)):
+            with self.assertRaises(ValueError):
+                self.b.normalize_intervals([interval])
+
+    def test_complete_ping_window_and_sufficient_measurement_coverage(self):
+        base = self.sample()["intervals"]
+        for intervals in (base[:3] + [self.interval(0, 30)], base[:-3], base[:13] + base[14:]):
+            self.assertFalse(self.b.loaded_overlap(self.sample(intervals)))
+        for gap, expected in ((.0005, True), (.002, False)):
+            intervals = copy.deepcopy(base)
+            intervals[10] = self.interval(7 + gap, 8)
+            self.assertEqual(self.b.loaded_overlap(self.sample(intervals)), expected)
+        intervals = copy.deepcopy(base)
+        for interval in intervals:
+            if not interval["omitted"] and interval["start"] < 12:
+                interval["bytes"] = 0
+        self.assertFalse(self.b.loaded_overlap(self.sample(intervals)))
+
+    def test_schedule_delayed_evidence_and_insufficient_budget(self):
+        timing = self.sample()["timings"]
+        full = self.b.ping_schedule(timing, 30, 1, 105)
+        self.assertEqual(full["count"], 55)
+        timing["transfer_evidence_s"] = 118
+        delayed = self.b.ping_schedule(timing, 30, 1, 121)
+        self.assertEqual(delayed["count"], 23)
+        self.assertEqual(delayed["budget_s"], 13)
+        timing["transfer_evidence_s"] = 125
+        with self.assertRaisesRegex(ValueError, "insufficient loaded-ping budget"):
+            self.b.ping_schedule(timing, 30, 1, 128)
+        with self.assertRaisesRegex(ValueError, "insufficient loaded-ping budget"):
+            self.b.ping_schedule(self.sample()["timings"], 10, 1, 105)
+
+    def test_late_replies_low_rtt_count_and_schedule_tampering_fail(self):
+        for end in (105.5, 123.81, 135):
+            sample = self.sample()
+            sample["timings"]["ping_end_s"] = end
+            self.assertFalse(self.b.loaded_overlap(sample))
+        sample = self.sample()
+        sample["schedule"]["reply_margin_s"] = 1
+        self.assertFalse(self.b.loaded_overlap(sample))
+        d = self.fixture()
+        sample = d["loss"]["0%"]["overlay"]["up"]["runs"][0]
+        sample["ping_stdout"] = self.ping_output(55, 19)
+        sample["loaded"] = self.b.ping_result(1, sample["ping_stdout"], 55)
+        sample["ping_rc"] = 1
+        with self.assertRaisesRegex(ValueError, "required RTT samples"):
+            self.b.validate(d)
+
+    def test_failed_samples_are_retained(self):
+        b = self.b.Bench.__new__(self.b.Bench)
+        b.a = mock.Mock(repeat=2)
+        b.iperf = mock.Mock(side_effect=[{"mbps": 10}, {"error": "iperf3 exited 1"}])
+        r = b.median()
+        self.assertIsNone(r["median_mbps"])
+        self.assertEqual(len(r["runs"]), 2)
+
+    def test_loaded_ping_runs_after_evidence_and_warmup(self):
+        b = self.b.Bench.__new__(self.b.Bench)
+        b.a = mock.Mock(duration=30)
+        b.command = lambda node, *args: [node, *args]
+        b.sh = mock.Mock(return_value=mock.Mock(returncode=0))
+        sample = self.sample()
+        server = mock.Mock()
+        server.poll.return_value = None
+        server.communicate.return_value = ("server", "")
+        load = mock.Mock(returncode=0)
+        load.poll.return_value = None
+        load.communicate.return_value = (sample["iperf_stdout"].encode(), b"")
+        clock = [100.0]
+        def evidence(process, prefix):
+            clock[0] = 102.0
+            return {k: sample["timings"][k] for k in ("test_start_s", "transfer_evidence_s", "transfer_index", "transfer_interval")}
+        def sleep(seconds):
+            clock[0] += seconds
+        def ping(node, to, count):
+            self.assertGreaterEqual(clock[0], 105.0)
+            self.assertEqual(count, 55)
+            clock[0] += 11
+            self.assertFalse(load.communicate.called)
+            return mock.Mock(returncode=0, stdout=sample["ping_stdout"], stderr="")
+        b.ping = ping
+        with mock.patch.object(self.b.subprocess, "Popen", side_effect=[server, load]), \
+                mock.patch.object(self.b.time, "sleep", side_effect=sleep), \
+                mock.patch.object(self.b.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(self.b, "wait_transfer", side_effect=evidence):
+            result = b.iperf("client", "server", "10.0.0.1", "10.0.0.2", 5201, False)
+        self.assertNotIn("error", result)
+        self.assertTrue(result["overlapped"])
+        self.assertEqual(result["mbps"], 12)
+
+    def test_failed_budget_retains_scheduling_inputs_without_pinging(self):
+        b = self.b.Bench.__new__(self.b.Bench)
+        b.a = mock.Mock(duration=5)
+        b.command = lambda node, *args: [node, *args]
+        b.sh = mock.Mock(return_value=mock.Mock(returncode=0))
+        b.ping = mock.Mock()
+        sample = self.sample()
+        server, load = mock.Mock(), mock.Mock(returncode=0)
+        server.poll.return_value = load.poll.return_value = None
+        server.communicate.return_value = ("server", "")
+        load.communicate.return_value = (sample["iperf_stdout"].encode(), b"")
+        evidence = {k: sample["timings"][k] for k in ("test_start_s", "transfer_evidence_s", "transfer_index", "transfer_interval")}
+        with mock.patch.object(self.b.subprocess, "Popen", side_effect=[server, load]), \
+                mock.patch.object(self.b, "wait_transfer", return_value=evidence), \
+                mock.patch.object(self.b.time, "sleep"), \
+                mock.patch.object(self.b.time, "monotonic", side_effect=[100, 102, 105]):
+            result = b.iperf("client", "server", "10.0.0.1", "10.0.0.2", 5201, False)
+        self.assertIn("insufficient loaded-ping budget", result["error"])
+        self.assertEqual(result["schedule"]["duration_s"], 5)
+        self.assertEqual(result["schedule"]["reply_margin_s"], 8)
+        self.assertEqual(result["schedule"]["guard_s"], .5)
+        self.assertLess(result["schedule"]["count"], 21)
+        b.ping.assert_not_called()
+
+    def test_boundary_warning_survives_later_invalid_interval(self):
+        intervals = self.sample()["intervals"]
+        intervals[3] = self.interval(3, 0, seconds=.001)
+        intervals[10]["seconds"] = .01
+        warnings = []
+        with self.assertRaisesRegex(ValueError, r"intervals\[10\]"):
+            self.b.normalize_intervals(intervals, warnings)
+        self.assertEqual(warnings, [{"index": 3, "reason": "reversed or empty interval"}])
+
+    def test_wait_transfer_ignores_excluded_boundary_until_delayed_valid_data(self):
+        start = {"event": "start", "data": {"test_start": {"omit": 3}}}
+        for boundary in (self.interval(3, 0, seconds=.001), self.interval(0, 1, seconds=.001)):
+            events = [start, {"event": "interval", "data": {"sum": self.interval(0, 1, True, size=0)}},
+                      {"event": "interval", "data": {"sum": boundary}}]
+            later = {"event": "interval", "data": {"sum": self.interval(1, 2)}}
+            script = "import time; print(%r, flush=True); time.sleep(0.3); print(%r, flush=True)" % (
+                "\n".join(json.dumps(e) for e in events), json.dumps(later))
+            process = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            before = time.monotonic()
+            prefix = bytearray()
+            try:
+                evidence = self.b.wait_transfer(process, prefix)
+                self.assertGreaterEqual(evidence["transfer_evidence_s"] - before, .25)
+                self.assertEqual(evidence["transfer_index"], 2)
+                self.assertEqual(evidence["transfer_interval"], later["data"]["sum"])
+                self.assertIn(json.dumps(boundary), prefix.decode())
+            finally:
+                process.communicate(timeout=3)
+
+    def test_failed_run_writes_incomplete_artifact_and_resets_owned_topology(self):
+        b = self.b.Bench.__new__(self.b.Bench)
+        b.a = mock.Mock(label="test", duration=5, repeat=1, no_overlay=False, raw=False, loss=["0"])
+        with tempfile.TemporaryDirectory() as tmp:
+            b.t = mock.Mock(rundir=tmp)
+            b.netem = mock.Mock()
+            b.idle = mock.Mock(side_effect=ValueError("no ping samples"))
+            with mock.patch.object(self.b.time, "sleep"):
+                self.assertEqual(b.run(), 1)
+            with open(os.path.join(tmp, "results", "bench-test.json")) as f:
+                d = json.load(f)
+            self.assertFalse(d["complete"])
+            self.assertEqual(d["error"], "no ping samples")
+            self.assertEqual(b.netem.call_args_list[-1], mock.call(None))
+
+
+class TestTunxdJob(unittest.TestCase):
+    def command(self, action, directory, *args):
+        return [sys.executable, os.path.join(HERE, "tunxd", "job.py"), action, "--jobdir", directory, *args]
+
+    def test_stop_is_idempotent_and_prevents_queued_job_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for _ in range(2):
+                stopped = subprocess.run(self.command("stop", directory), capture_output=True, text=True, timeout=5)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            marker = os.path.join(directory, "unexpected")
+            script = "from pathlib import Path; Path(%r).touch()" % marker
+            run = subprocess.run(self.command("run", directory, "--", sys.executable, "-c", script),
+                                 capture_output=True, text=True, timeout=5)
+            self.assertEqual(run.returncode, 143, run.stderr)
+            self.assertFalse(os.path.exists(marker))
+
+    def test_stop_acknowledges_only_after_child_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            started = os.path.join(directory, "started")
+            finished = os.path.join(directory, "finished")
+            script = """import signal,time,sys
+from pathlib import Path
+def stop(signum, frame):
+    time.sleep(.2)
+    Path(%r).touch()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+Path(%r).touch()
+while True:
+    time.sleep(.05)
+""" % (finished, started)
+            run = subprocess.Popen(self.command("run", directory, "--", sys.executable, "-c", script),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.exists(started):
+                    if run.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("owned child did not start")
+                    time.sleep(.02)
+                stop = subprocess.run(self.command("stop", directory), capture_output=True, text=True, timeout=5)
+                self.assertEqual(stop.returncode, 0, stop.stderr)
+                self.assertTrue(os.path.exists(finished))
+                _, stderr = run.communicate(timeout=5)
+                self.assertEqual(run.returncode, 143, stderr)
+            finally:
+                if run.poll() is None:
+                    subprocess.run(self.command("stop", directory), capture_output=True, timeout=6)
+                    run.communicate(timeout=6)
+
+
+class TestTunxdWrapper(unittest.TestCase):
+    def wrapper(self, *, remote_rc=0, copy_rc=0, bad_json=False, sigterm=False, stop_rc=0,
+                checksum_ok=True, transfer_rc=0, transfer_target="xray", xray_version="v1"):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.mkdir(bindir)
+            fixture = os.path.join(tmp, "fixture")
+            for directory in ("results", "logs", "nodes"):
+                os.makedirs(os.path.join(fixture, directory))
+            t = model.load(os.path.join(HERE, "topologies", "two-sites-tunxd.yaml"))
+            s = scenario.load(os.path.join(HERE, "scenarios", "tunxd-plain.yaml"), t)
+            with open(os.path.join(fixture, "results", "tunxd-plain.json"), "w") as f:
+                if bad_json:
+                    f.write("{bad json")
+                else:
+                    json.dump({"passed": True, "steps": [{"status": "pass"} for _ in s.steps]}, f)
+            archive = os.path.join(tmp, "evidence.tar")
+            with tarfile.open(archive, "w") as tar:
+                for directory in ("results", "logs", "nodes"):
+                    tar.add(os.path.join(fixture, directory), arcname=directory)
+            xray_archive = os.path.join(tmp, "Xray-linux-64.zip")
+            with zipfile.ZipFile(xray_archive, "w") as z:
+                z.writestr("xray", b"verified executable fixture\n")
+            with open(xray_archive, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            xray_digest = os.path.join(tmp, "Xray-linux-64.zip.dgst")
+            with open(xray_digest, "w") as f:
+                f.write("SHA2-256= " + (digest if checksum_ok else "0" * 64) + "\n")
+            scripts = {
+                "go": "import pathlib,sys; pathlib.Path(sys.argv[sys.argv.index('-o')+1]).touch()",
+                "curl": """import json,os,shutil,sys
+from pathlib import Path
+root = Path(os.environ['FIXTURE_ROOT'])
+with (root / 'calls').open('a') as f:
+    f.write(json.dumps({'kind': 'curl', 'argv': sys.argv[1:]}) + '\\n')
+target = sys.argv[sys.argv.index('-o') + 1]
+url = sys.argv[-1]
+if url.endswith('/releases/latest'):
+    Path(target).write_text(json.dumps({'tag_name': 'v9.8.7'}))
+elif url.endswith('.zip.dgst'):
+    shutil.copyfile(os.environ['FIXTURE_XRAY_DIGEST'], target)
+elif url.endswith('.zip'):
+    shutil.copyfile(os.environ['FIXTURE_XRAY_ARCHIVE'], target)
+else:
+    sys.exit('unexpected curl URL: ' + url)
+""",
+                "ssh": """import json,os,sys,time
+from pathlib import Path
+root = Path(os.environ['FIXTURE_ROOT'])
+def record(value):
+    with (root / 'events').open('a') as f:
+        f.write(value + '\\n')
+cmd = sys.argv[-1]
+script = sys.stdin.read() if cmd.startswith('sh -s -- ') else ''
+with (root / 'calls').open('a') as f:
+    f.write(json.dumps({'kind': 'ssh', 'command': cmd, 'script': script}) + '\\n')
+if cmd.startswith('sh -s -- tunx-e2e '):
+    print('/tmp/tunx-wrapper-fixture')
+elif cmd.startswith('cat >') and '/bin/xray' in cmd:
+    target = 'xray.version' if '/bin/xray.version' in cmd else 'xray'
+    data = sys.stdin.buffer.read()
+    if target == os.environ['FIXTURE_TRANSFER_TARGET'] and int(os.environ['FIXTURE_TRANSFER_RC']):
+        sys.exit(int(os.environ['FIXTURE_TRANSFER_RC']))
+    (root / ('transferred-' + target)).write_bytes(data)
+elif 'python3 sim.py run' in cmd:
+    if os.environ['FIXTURE_SIGNAL'] == '1':
+        record('job-start')
+        (root / 'running').touch()
+        while not (root / 'stop').exists():
+            time.sleep(.02)
+        time.sleep(.3)
+        (root / 'running').unlink()
+        record('job-stopped')
+        (root / 'stopped').touch()
+        sys.exit(143)
+    print('result: all passed -> PASS')
+    sys.exit(int(os.environ['FIXTURE_REMOTE_RC']))
+elif 'job.py' in cmd and ' stop --jobdir ' in cmd:
+    if os.environ['FIXTURE_SIGNAL'] == '1':
+        record('stop-request')
+        if int(os.environ['FIXTURE_STOP_RC']):
+            sys.exit(int(os.environ['FIXTURE_STOP_RC']))
+        (root / 'stop').touch()
+        while not (root / 'stopped').exists():
+            time.sleep(.02)
+        record('stop-ack')
+elif cmd.startswith('sh -s -- /tmp/tunx-wrapper-fixture '):
+    if os.environ['FIXTURE_SIGNAL'] == '1':
+        if (root / 'running').exists():
+            record('premature-cleanup')
+            sys.exit(1)
+        record('cleanup')
+        record('lock-release')
+elif 'sudo tar -C' in cmd:
+    if int(os.environ['FIXTURE_COPY_RC']):
+        sys.exit(int(os.environ['FIXTURE_COPY_RC']))
+    with open(os.environ['FIXTURE_ARCHIVE'], 'rb') as f:
+        sys.stdout.buffer.write(f.read())
+"""}
+            for name, script in scripts.items():
+                path = os.path.join(bindir, name)
+                with open(path, "w") as f:
+                    f.write("#!/usr/bin/env python3\n" + script + "\n")
+                os.chmod(path, 0o755)
+            env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"],
+                       TUNX_SIM_OUT=os.path.join(tmp, "out"), TUNX_SIM_HOST="fixture",
+                       TUNX_SIM_DIR="tunx-e2e", SIM_SET="", XRAY_PROXY="", XRAY_VERSION=xray_version,
+                       FIXTURE_REMOTE_RC=str(remote_rc), FIXTURE_COPY_RC=str(copy_rc), FIXTURE_ARCHIVE=archive,
+                       FIXTURE_ROOT=tmp, FIXTURE_SIGNAL="1" if sigterm else "0", FIXTURE_STOP_RC=str(stop_rc),
+                       FIXTURE_XRAY_ARCHIVE=xray_archive, FIXTURE_XRAY_DIGEST=xray_digest,
+                       FIXTURE_TRANSFER_RC=str(transfer_rc), FIXTURE_TRANSFER_TARGET=transfer_target,
+                       PYTHONDONTWRITEBYTECODE="1")
+            command = ["sh", os.path.join(HERE, "run-tunxd.sh"), "tunxd-plain"]
+            if not sigterm:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30, env=env)
+                with open(os.path.join(tmp, "calls")) as f:
+                    result.calls = [json.loads(line) for line in f]
+                runs = os.listdir(env["TUNX_SIM_OUT"])
+                evidence = os.path.join(env["TUNX_SIM_OUT"], runs[0], "xray")
+                result.xray_files = {}
+                for name in os.listdir(evidence):
+                    with open(os.path.join(evidence, name), "rb") as f:
+                        result.xray_files[name] = f.read()
+                result.transferred = {}
+                for name in ("xray", "xray.version"):
+                    path = os.path.join(tmp, "transferred-" + name)
+                    if os.path.exists(path):
+                        with open(path, "rb") as f:
+                            result.transferred[name] = f.read()
+                return result
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            try:
+                deadline = time.monotonic() + 15
+                while not os.path.exists(os.path.join(tmp, "running")):
+                    if process.poll() is not None or time.monotonic() >= deadline:
+                        self.fail("mock remote job did not start")
+                    time.sleep(.02)
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 143, stdout + stderr)
+                with open(os.path.join(tmp, "events")) as f:
+                    events = f.read().splitlines()
+                if stop_rc:
+                    self.assertEqual(events, ["job-start", "stop-request"])
+                    self.assertIn("remote job stop unconfirmed; lock and evidence retained", stderr)
+                else:
+                    self.assertEqual(events, ["job-start", "stop-request", "job-stopped", "stop-ack", "cleanup", "lock-release"])
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+
+    def test_local_xray_download_retains_verified_evidence_and_pin(self):
+        for version, tag in (("v1", "v1"), ("", "v9.8.7")):
+            with self.subTest(version=version):
+                result = self.wrapper(xray_version=version)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                evidence = result.xray_files
+                digest = hashlib.sha256(evidence["Xray-linux-64.zip"]).hexdigest()
+                self.assertEqual(evidence["Xray-linux-64.zip.dgst"].decode().strip(), "SHA2-256= " + digest)
+                self.assertEqual(evidence["SHA256SUMS"].decode().strip(), digest + "  Xray-linux-64.zip")
+                self.assertEqual(evidence["xray.version"].decode().strip(), tag)
+                self.assertIn("/download/" + tag + "/", evidence["source.txt"].decode())
+                self.assertEqual(result.transferred["xray"], b"verified executable fixture\n")
+                self.assertEqual(result.transferred["xray.version"], (tag + "\n").encode())
+                self.assertEqual("release.json" in evidence, not version)
+
+    def test_xray_checksum_failure_stops_before_remote_work(self):
+        result = self.wrapper(checksum_ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("xray: checksum mismatch", result.stderr)
+        self.assertTrue(all(call["kind"] == "curl" for call in result.calls))
+        self.assertIn("Xray-linux-64.zip", result.xray_files)
+        self.assertIn("Xray-linux-64.zip.dgst", result.xray_files)
+        self.assertNotIn("xray", result.xray_files)
+
+    def test_xray_transfer_failures_are_fatal_and_cleanup_safe(self):
+        for target in ("xray", "xray.version"):
+            with self.subTest(target=target):
+                result = self.wrapper(transfer_rc=42, transfer_target=target)
+                self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+                remote = [call for call in result.calls if call["kind"] == "ssh"]
+                self.assertIn('rmdir "$4"', remote[-1]["script"])
+                self.assertFalse(any("python3 sim.py run" in call["command"] for call in remote))
+
+    def test_remote_commands_do_not_download_xray(self):
+        result = self.wrapper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first_remote = next(i for i, call in enumerate(result.calls) if call["kind"] == "ssh")
+        self.assertEqual([call["kind"] for call in result.calls[:first_remote]], ["curl", "curl"])
+        for call in result.calls[first_remote:]:
+            self.assertEqual(call["kind"], "ssh")
+            content = call["command"] + call["script"]
+            self.assertNotIn("curl", content)
+            self.assertNotIn("github.com", content)
+            self.assertNotIn("zipfile", content)
+
+    def test_sigterm_stops_and_waits_for_job_before_cleanup_releases_lock(self):
+        self.wrapper(sigterm=True)
+
+    def test_unconfirmed_stop_retains_lock_and_signal_status(self):
+        self.wrapper(sigterm=True, stop_rc=42)
+
+    def test_valid_artifacts_and_successful_ssh_pass(self):
+        result = self.wrapper()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ALL PASS", result.stdout)
+
+    def test_pass_text_does_not_override_ssh_failure(self):
+        result = self.wrapper(remote_rc=42)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("-> PASS", result.stdout)
+        self.assertIn("FAILED", result.stdout)
+
+    def test_copy_failure_cannot_pass(self):
+        result = self.wrapper(copy_rc=42)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("evidence copy failed", result.stderr)
+
+    def test_invalid_scenario_json_cannot_pass(self):
+        result = self.wrapper(bad_json=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAILED", result.stdout)
 
 
 class TestProbe(unittest.TestCase):

@@ -12,10 +12,12 @@ import (
 )
 
 // handleTCP runs in its own goroutine for every new SYN (the forwarder starts
-// it). The handshake is completed lazily, on the handler's first read or
-// write, so a handler that refuses the flow, or fails to reach the
-// destination, leaves the SYN unanswered (or reset, see TCPRejectWithReset).
-// The SYN occupies a forwarder slot until then, which bounds the backlog.
+// it). The handshake completes when the handler accepts the flow
+// (core.Accept) or first reads or writes it, so a handler that refuses the
+// flow, or fails to reach the destination, leaves the SYN unanswered. Only a
+// refusal with core.ReasonRefused (the destination reset the connection)
+// answers with RST, unless TCPRejectWithReset makes every refusal do so. The
+// SYN occupies a forwarder slot until then, which bounds the backlog.
 func (s *Stack) handleTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
 	f := &tcpFlow{s: s, req: r, ready: make(chan struct{})}
@@ -124,7 +126,22 @@ func (f *tcpFlow) CloseWrite() error {
 	return c.CloseWrite()
 }
 
-func (f *tcpFlow) Close() error {
+// Accept completes the handshake.
+func (f *tcpFlow) Accept() error {
+	_, err := f.accept()
+	return err
+}
+
+// Refuse closes the flow; before the handshake the SYN is answered with RST
+// for core.ReasonRefused and dropped otherwise (see TCPRejectWithReset).
+func (f *tcpFlow) Refuse(r core.Reason) error {
+	return f.close(r == core.ReasonRefused || f.s.cfg.TCPRejectWithReset)
+}
+
+func (f *tcpFlow) Close() error { return f.close(f.s.cfg.TCPRejectWithReset) }
+
+// close closes the flow; rst says how to answer a SYN not yet accepted.
+func (f *tcpFlow) close(rst bool) error {
 	f.closeOnce.Do(func() {
 		f.mu.Lock()
 		prev := f.state
@@ -133,7 +150,7 @@ func (f *tcpFlow) Close() error {
 		f.mu.Unlock()
 		switch prev {
 		case tcpIdle:
-			f.req.Complete(f.s.cfg.TCPRejectWithReset)
+			f.req.Complete(rst)
 		case tcpAccepted:
 			c.Close()
 		}

@@ -1,0 +1,131 @@
+# The reference scenario of docs/design.md for tunxd: two-sites.yaml with
+# IPv6 on both LANs, a plain host and a terminal node at site A, a second
+# relay ("exit") next to the hub, an HTTPS server that VLESS + Reality uses as
+# its target, and return routes for source preservation at site B.
+#
+#                         internet 203.0.113.0/24, 2001:db8:113::/64
+#   hub .10   exit .20   web .80 (https 443)   router-a .11   carrier .12
+#                                                  |               |  firewall: from mob0 only
+#                                           lan-a 10.0.1.0/24      |  TCP 443/4430 to hub and exit, NAT
+#                                           fd00:a::/64            |
+#                                           gw-a .2  term-a .10    |
+#                                           host-a .20             |
+#                                                         mobile 100.64.0.0/24 (netem)
+#                                                                  |
+#                                                            router-b .2 (NAT)
+#                                                                  |
+#                                                         lan-b 10.0.2.0/24, fd00:b::/64
+#                                                         gw-b .2  host-b .10
+#
+# Overlay 10.200.0.0/24 and fd74:756e:7800::/64: hub .1, gw-a .2, gw-b .3,
+# term-a .4. tunxd and Xray are started by the scenarios (tunxd-*.yaml); the
+# configs are written by tunxd/gen.py.
+
+name: two-sites-tunxd
+prefix: tx
+
+vars:
+  mobile_delay: 40ms   # one-way, applied in each direction (RTT about 2x)
+  mobile_loss: 0%
+
+segments:
+  internet:
+    subnet: [203.0.113.0/24, 2001:db8:113::/64]
+  mobile:
+    subnet: 100.64.0.0/24
+    netem: {delay: "${mobile_delay}", loss: "${mobile_loss}"}
+  lan-a:
+    subnet: [10.0.1.0/24, fd00:a::/64]
+  lan-b:
+    subnet: [10.0.2.0/24, fd00:b::/64]
+
+nodes:
+  hub:
+    sysctl:
+      net.ipv4.ping_group_range: "0 2147483647"
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.10, "2001:db8:113::10"]}
+
+  exit:
+    sysctl:
+      net.ipv4.ping_group_range: "0 2147483647"
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.20, "2001:db8:113::20"]}
+
+  # A public server: probe on TCP 80 and UDP 53, HTTPS on 443 (Reality target).
+  web:
+    interfaces:
+      eth0: {segment: internet, addr: [203.0.113.80, "2001:db8:113::80"]}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 80 --udp 53
+      - exec python3 ${sim}/tunxd/tlsweb.py --port 443 --name www.example.test
+
+  router-a:
+    forward: true
+    interfaces:
+      wan0: {segment: internet, addr: [203.0.113.11, "2001:db8:113::11"], nat: masquerade}
+      lan0: {segment: lan-a, addr: [10.0.1.1, "fd00:a::1"]}
+    routes:
+      - 10.0.2.0/24 via 10.0.1.2          # site B, through the overlay on gw-a
+      - fd00:b::/64 via fd00:a::2
+
+  gw-a:
+    forward: true
+    sysctl:
+      net.ipv4.ping_group_range: "0 2147483647"
+    interfaces:
+      eth0: {segment: lan-a, addr: [10.0.1.2, "fd00:a::2"], gateway: 10.0.1.1, gateway6: "fd00:a::1"}
+
+  host-a:
+    interfaces:
+      eth0: {segment: lan-a, addr: [10.0.1.20, "fd00:a::20"], gateway: 10.0.1.1, gateway6: "fd00:a::1"}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 22,80 --udp 53
+
+  # A terminal node: tunxd on the host itself, linked to gw-a.
+  term-a:
+    sysctl:
+      net.ipv4.ping_group_range: "0 2147483647"
+    interfaces:
+      eth0: {segment: lan-a, addr: [10.0.1.10, "fd00:a::10"], gateway: 10.0.1.1, gateway6: "fd00:a::1"}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 22
+
+  carrier:
+    forward: true
+    interfaces:
+      wan0: {segment: internet, addr: 203.0.113.12, nat: masquerade}
+      mob0: {segment: mobile, addr: 100.64.0.1}
+    firewall:
+      - iif: mob0
+        allow:
+          - {proto: tcp, to: "${hub.eth0}", ports: [443, 4430]}
+          - {proto: tcp, to: "${hub.eth0}", ports: [5201]}   # raw baseline of tunxd/bench.py
+          - {proto: tcp, to: "${exit.eth0}", ports: [443, 4430]}
+        default: drop
+
+  router-b:
+    forward: true
+    interfaces:
+      wan0: {segment: mobile, addr: 100.64.0.2, gateway: 100.64.0.1, nat: masquerade}
+      lan0: {segment: lan-b, addr: [10.0.2.1, "fd00:b::1"]}
+    routes:
+      # Site A and the overlay through gw-b: gw-b delivers with the original
+      # source (source: preserve), so replies must come back to it.
+      - 10.0.1.0/24 via 10.0.2.2
+      - 10.200.0.0/24 via 10.0.2.2
+      - fd00:a::/64 via fd00:b::2
+      - fd74:756e:7800::/64 via fd00:b::2
+
+  gw-b:
+    forward: true
+    sysctl:
+      net.ipv4.ping_group_range: "0 2147483647"
+    interfaces:
+      eth0: {segment: lan-b, addr: [10.0.2.2, "fd00:b::2"], gateway: 10.0.2.1, gateway6: "fd00:b::1"}
+
+  host-b:
+    interfaces:
+      eth0: {segment: lan-b, addr: [10.0.2.10, "fd00:b::10"], gateway: 10.0.2.1, gateway6: "fd00:b::1"}
+    start:
+      - exec python3 ${sim}/probe.py serve --tcp 22,25,80 --udp 53

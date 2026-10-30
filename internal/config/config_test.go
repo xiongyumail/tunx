@@ -93,6 +93,9 @@ func TestValidateErrors(t *testing.T) {
 		{base + `, "peers": [{"name": "b"}]`, "public_key missing"},
 		{base + `, "peers": [{"name": "b", "public_key": "AAAA"}]`, "invalid public key"},
 		{base + `, "peers": [{"name": "b", "public_key": "` + pub + `", "interface": "eth0"}]`, "need a dial address"},
+		{base + `, "peers": [{"name": "b", "public_key": "` + pub + `", "congestion": "bbr"}]`, "need a dial address"},
+		{base + `, "peers": [{"name": "b", "public_key": "` + pub + `", "dial": "127.0.0.1:1", "congestion": "BBR!"}]`, "not a congestion control name"},
+		{base + `, "listen": [{"address": "127.0.0.1:7700", "congestion": "a b"}]`, "listen[0]: congestion"},
 		{base + `, "routes": [{"prefix": "10.0.0.1/8", "advertisers": [{"node": "a"}]}]`, "host bits"},
 		{base + `, "routes": [{"prefix": "10.0.0.0/33", "advertisers": [{"node": "a"}]}]`, "10.0.0.0/33"},
 		{base + `, "routes": [{"prefix": "10.0.0.0/8"}]`, "no advertisers"},
@@ -109,6 +112,7 @@ func TestValidateErrors(t *testing.T) {
 		{base + `, "policy": [{"action": "allow", "dst": ["10.0.0.1/8"]}]`, "host bits"},
 		{base + `, "link": {"keepalive_interval": "10s", "keepalive_timeout": "5s"}`, "keepalive_timeout must be longer"},
 		{base + `, "link": {"keepalive_interval": "soon"}`, "invalid duration"},
+		{base + `, "link": {"stream_buffer": 1000}`, "stream_buffer 1000 out of range"},
 		{base + `, "log_level": "loud"`, "log_level"},
 		{base + `, "routs": []`, "unknown field"},
 		{`"node": "a", "network": "n", "private_key": "` + key + `", "peers": [` + peerB + `]`, "never form a link"},
@@ -220,3 +224,17 @@ func TestParsePrivateKey(t *testing.T) {
 
 func netipMust(s string) netip.Addr         { return netip.MustParseAddr(s) }
 func netipPortMust(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
+
+func TestStreamBuffer(t *testing.T) {
+	key, _ := seed(t)
+	c, err := Parse([]byte(`{"node": "a", "network": "n", "private_key": "` + key + `", "listen": [{"address": "127.0.0.1:7700"}], "link": {"stream_buffer": 1048576}}`))
+	if err == nil {
+		err = c.Validate("")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.LinkConfig().MaxStreamBuffer; got != 1<<20 {
+		t.Errorf("MaxStreamBuffer = %d, want %d", got, 1<<20)
+	}
+}

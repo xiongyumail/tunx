@@ -65,6 +65,82 @@ type Flow interface {
 	CloseWrite() error
 }
 
+// Reason says why a flow was refused. It travels in the open answer of a
+// link flow (see docs/protocol.md), so its values are part of the wire
+// format.
+type Reason uint8
+
+const (
+	// ReasonError covers everything else, including a flow closed without
+	// an answer.
+	ReasonError Reason = 1
+	// ReasonRefused: the destination refused the connection (a TCP reset).
+	ReasonRefused Reason = 2
+	// ReasonUnreachable: the destination host or network is unreachable,
+	// or the connection attempt timed out.
+	ReasonUnreachable Reason = 3
+	// ReasonDenied: the access policy denied the flow.
+	ReasonDenied Reason = 4
+	// ReasonNoRoute: no advertiser of the destination is reachable.
+	ReasonNoRoute Reason = 5
+	// ReasonHopLimit: the flow would cross more links than allowed.
+	ReasonHopLimit Reason = 6
+)
+
+func (r Reason) String() string {
+	switch r {
+	case ReasonError:
+		return "error"
+	case ReasonRefused:
+		return "refused"
+	case ReasonUnreachable:
+		return "unreachable"
+	case ReasonDenied:
+		return "denied"
+	case ReasonNoRoute:
+		return "no_route"
+	case ReasonHopLimit:
+		return "hop_limit"
+	}
+	return "reason(" + itoa(int(r)) + ")"
+}
+
+// OpenError is returned by a flow whose far end refused to open it.
+type OpenError struct{ Reason Reason }
+
+func (e *OpenError) Error() string { return "flow refused: " + e.Reason.String() }
+
+// Answerer is implemented by flows whose opener waits for an answer before
+// it may use the flow: a TCP connection captured from the TUN (the answer
+// completes or refuses the handshake) and a flow a peer opened over a link
+// (the answer is the open acknowledgement). A handler answers with Accept
+// once the flow is connected onward, or with Refuse when it cannot be.
+// Without an explicit answer the first Write accepts, and Close refuses with
+// ReasonError.
+type Answerer interface {
+	// Accept confirms the flow. Calling it again does nothing.
+	Accept() error
+	// Refuse answers with a refusal, when no answer was sent yet, and
+	// closes the flow.
+	Refuse(Reason) error
+}
+
+// Accept accepts f if it waits for an answer.
+func Accept(f Flow) error {
+	if a, ok := f.(Answerer); ok {
+		return a.Accept()
+	}
+	return nil
+}
+
+// Refuse refuses f with reason r if it waits for an answer, and closes it.
+func Refuse(f Flow, r Reason) error {
+	if a, ok := f.(Answerer); ok {
+		return a.Refuse(r)
+	}
+	return f.Close()
+}
+
 // Ingress says where a flow entered this node.
 type Ingress struct {
 	// Kind is "tun" for traffic captured locally, "link" for traffic from a

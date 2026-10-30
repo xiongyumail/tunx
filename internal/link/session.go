@@ -26,22 +26,24 @@ const (
 // Session is an authenticated, multiplexed link to one peer. Either side
 // opens flows with OpenFlow; flows the peer opens wait until Serve takes them.
 type Session struct {
-	cfg    Config
-	peer   string
-	client bool
-	mux    *smux.Session
-	start  time.Time
+	cfg     Config
+	peer    string
+	client  bool
+	version uint8
+	mux     *smux.Session
+	start   time.Time
 
 	incoming chan inbound
 
 	ctrlOnce  sync.Once
 	ctrlReady chan struct{}
 	ctrl      *smux.Stream
-	ctrlMu    sync.Mutex // serializes control writes
+	ctrlMu    sync.Mutex  // serializes control writes
+	pongs     chan []byte // one pending response; another may be in flight
 
-	lastPong atomic.Int64 // nanoseconds since start
-	srtt     atomic.Int64 // smoothed RTT, nanoseconds
-	pinging  atomic.Bool
+	lastReceive atomic.Int64 // underlying transport reads, nanoseconds since start
+	srtt        atomic.Int64 // smoothed RTT, nanoseconds
+	pinging     atomic.Bool
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -79,11 +81,12 @@ func handshake(ctx context.Context, conn net.Conn, cfg Config, client bool) (*Se
 	stop := context.AfterFunc(ctx, func() { conn.SetDeadline(time.Unix(1, 0)) })
 
 	var peer string
+	var version uint8
 	var err error
 	if client {
-		peer, _, err = clientHandshake(conn, &cfg)
+		peer, version, err = clientHandshake(conn, &cfg)
 	} else {
-		peer, _, err = serverHandshake(conn, &cfg)
+		peer, version, err = serverHandshake(conn, &cfg)
 	}
 	if !stop() && err == nil {
 		err = ctx.Err()
@@ -97,16 +100,16 @@ func handshake(ctx context.Context, conn net.Conn, cfg Config, client bool) (*Se
 	}
 	conn.SetDeadline(time.Time{})
 
-	s, err := newSession(conn, cfg, peer, client)
+	s, err := newSession(conn, cfg, peer, client, version)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	cfg.Logger.Info("link session up", "peer", peer, "client", client)
+	cfg.Logger.Info("link session up", "peer", peer, "client", client, "version", version)
 	return s, nil
 }
 
-func newSession(conn net.Conn, cfg Config, peer string, client bool) (*Session, error) {
+func newSession(conn net.Conn, cfg Config, peer string, client bool, version uint8) (*Session, error) {
 	mc := &smux.Config{
 		Version:           2,
 		KeepAliveDisabled: true,
@@ -114,26 +117,31 @@ func newSession(conn net.Conn, cfg Config, peer string, client bool) (*Session, 
 		MaxReceiveBuffer:  cfg.MaxReceiveBuffer,
 		MaxStreamBuffer:   cfg.MaxStreamBuffer,
 	}
-	var mux *smux.Session
-	var err error
-	if client {
-		mux, err = smux.Client(conn, mc)
-	} else {
-		mux, err = smux.Server(conn, mc)
-	}
-	if err != nil {
-		return nil, err
-	}
 	s := &Session{
 		cfg:       cfg,
 		peer:      peer,
 		client:    client,
-		mux:       mux,
+		version:   version,
 		start:     time.Now(),
 		incoming:  make(chan inbound),
 		ctrlReady: make(chan struct{}),
+		pongs:     make(chan []byte, 1),
 		done:      make(chan struct{}),
 	}
+	s.lastReceive.Store(s.since())
+	// Start observing only after authentication, before smux can read ahead.
+	observed := &receiveConn{Conn: conn, start: s.start, last: &s.lastReceive}
+	var mux *smux.Session
+	var err error
+	if client {
+		mux, err = smux.Client(observed, mc)
+	} else {
+		mux, err = smux.Server(observed, mc)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.mux = mux
 	if client {
 		// The dialing side opens the control stream first.
 		st, err := mux.OpenStream()
@@ -158,8 +166,32 @@ func newSession(conn net.Conn, cfg Config, peer string, client bool) (*Session, 
 	return s, nil
 }
 
+// receiveConn observes bytes actually returned by the authenticated transport.
+// Buffered application reads and successful writes cannot refresh liveness.
+type receiveConn struct {
+	net.Conn
+	start time.Time
+	last  *atomic.Int64
+}
+
+func (c *receiveConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		now := int64(time.Since(c.start))
+		for old := c.last.Load(); now > old; old = c.last.Load() {
+			if c.last.CompareAndSwap(old, now) {
+				break
+			}
+		}
+	}
+	return n, err
+}
+
 // Peer returns the authenticated name of the node on the other end.
 func (s *Session) Peer() string { return s.peer }
+
+// Version returns the negotiated protocol version.
+func (s *Session) Version() uint8 { return s.version }
 
 // RTT returns the smoothed round-trip time of keepalive pings, or 0 before
 // the first pong.
@@ -194,7 +226,9 @@ func (s *Session) closeWith(err error) {
 }
 
 // OpenFlow opens a flow to the peer. A deadline on ctx bounds sending the
-// stream header.
+// stream header. The flow may be written at once; its first Read, or
+// WaitOpen, returns the peer's answer first: a *core.OpenError when the peer
+// refused the flow.
 func (s *Session) OpenFlow(ctx context.Context, meta core.FlowMeta) (core.Flow, error) {
 	body, err := encodeFlowMeta(meta)
 	if err != nil {
@@ -218,7 +252,7 @@ func (s *Session) OpenFlow(ctx context.Context, meta core.FlowMeta) (core.Flow, 
 		return nil, err
 	}
 	st.SetWriteDeadline(time.Time{})
-	return newFlow(st, meta.Proto), nil
+	return newFlow(st, meta.Proto, s.answers(), true), nil
 }
 
 // Serve hands flows opened by the peer to h, each in its own goroutine, with
@@ -246,6 +280,9 @@ func (s *Session) Serve(ctx context.Context, h core.Handler) error {
 		}
 	}
 }
+
+// answers reports whether flows on this session carry an open answer.
+func (s *Session) answers() bool { return s.version >= versionAnswer }
 
 func (s *Session) acceptLoop() {
 	for {
@@ -278,7 +315,7 @@ func (s *Session) handleStream(st *smux.Stream) {
 			st.Close()
 			return
 		}
-		f := newFlow(st, meta.Proto)
+		f := newFlow(st, meta.Proto, s.answers(), false)
 		select {
 		case s.incoming <- inbound{meta: meta, flow: f}:
 		case <-s.done:
@@ -296,6 +333,7 @@ func (s *Session) setControl(st *smux.Stream) bool {
 		s.ctrl = st
 		close(s.ctrlReady)
 		go s.controlLoop(st)
+		go s.pongLoop()
 		ok = true
 	})
 	return ok
@@ -321,11 +359,35 @@ func (s *Session) controlLoop(st *smux.Stream) {
 		}
 		switch typ := h[0]; {
 		case typ == ctrlPing:
-			s.writeControl(time.Now().Add(s.cfg.KeepaliveTimeout), ctrlPong, payload)
+			// Do not let an outbound stall stop the sole control reader.
+			// Payloads are bounded by MaxControlLen; redundant requests
+			// are dropped while one response is pending.
+			select {
+			case s.pongs <- payload:
+			default:
+			}
 		case typ == ctrlPong:
 			s.onPong(payload)
 		case typ >= MinControlType && s.cfg.OnControl != nil:
 			s.cfg.OnControl(s, typ, payload)
+		}
+	}
+}
+
+// pongLoop is the only pong writer: one in-flight write and one queued
+// payload. The queue stays open; done and closing smux unblock shutdown.
+func (s *Session) pongLoop() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case payload := <-s.pongs:
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			s.writeControl(time.Now().Add(s.cfg.KeepaliveTimeout), ctrlPong, payload)
 		}
 	}
 }
@@ -374,7 +436,6 @@ func (s *Session) onPong(payload []byte) {
 	if sent < 0 || sent > now {
 		return
 	}
-	s.lastPong.Store(now)
 	rtt := now - sent
 	if old := s.srtt.Load(); old != 0 {
 		rtt = (7*old + rtt) / 8
@@ -382,7 +443,8 @@ func (s *Session) onPong(payload []byte) {
 	s.srtt.Store(rtt)
 }
 
-// keepalive pings the peer and closes the session when pongs stop.
+// keepalive closes after no transport bytes arrive for KeepaliveTimeout,
+// checked every max(timeout/8, 1 ms). Pongs measure RTT independently.
 func (s *Session) keepalive() {
 	ping := time.NewTicker(s.cfg.KeepaliveInterval)
 	defer ping.Stop()
@@ -394,7 +456,7 @@ func (s *Session) keepalive() {
 		case <-s.done:
 			return
 		case <-check.C:
-			if s.since()-s.lastPong.Load() > timeout {
+			if s.since()-s.lastReceive.Load() > timeout {
 				s.closeWith(ErrKeepalive)
 				return
 			}

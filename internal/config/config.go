@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -72,6 +73,9 @@ type TUN struct {
 // inbound.
 type Listener struct {
 	Address string `json:"address"`
+	// Congestion is the TCP congestion control of accepted link
+	// connections (see Peer.Congestion).
+	Congestion string `json:"congestion,omitempty"`
 }
 
 // Peer is a node this node holds a link with.
@@ -84,6 +88,11 @@ type Peer struct {
 	// Interface and Mark apply to the dialing socket.
 	Interface string `json:"interface,omitempty"`
 	Mark      uint32 `json:"mark,omitempty"`
+	// Congestion sets the TCP congestion control of the dialing socket
+	// ("bbr", "cubic", ...; empty or "default": the system default). It
+	// matters when this socket itself crosses the lossy path, not when it
+	// dials a local Xray (set Xray's sockopt tcpcongestion there).
+	Congestion string `json:"congestion,omitempty"`
 	// Priority orders peers for routes with via "*"; lower first.
 	Priority int `json:"priority,omitempty"`
 	// RelayFor lists the identities (patterns or "@group") this peer may
@@ -125,6 +134,10 @@ type LinkTimers struct {
 	HandshakeTimeout  Duration `json:"handshake_timeout,omitzero"`
 	KeepaliveInterval Duration `json:"keepalive_interval,omitzero"`
 	KeepaliveTimeout  Duration `json:"keepalive_timeout,omitzero"`
+	// StreamBuffer is the per-flow window in bytes (default 4 MiB). Larger
+	// lets one flow go faster on a long path; smaller bounds how much one
+	// bulk flow queues ahead of the others sharing the link.
+	StreamBuffer int `json:"stream_buffer,omitzero"`
 }
 
 // Duration is a time.Duration written as "5s" in JSON.
@@ -289,6 +302,9 @@ func (c *Config) Validate(dir string) error {
 		if _, _, err := net.SplitHostPort(l.Address); err != nil {
 			return fmt.Errorf("listen[%d]: address %q: %v", i, l.Address, err)
 		}
+		if err := checkCongestion(l.Congestion); err != nil {
+			return fmt.Errorf("listen[%d]: %w", i, err)
+		}
 	}
 	if c.Status != "" {
 		if err := checkLoopback(c.Status); err != nil {
@@ -301,6 +317,9 @@ func (c *Config) Validate(dir string) error {
 	lt := c.Link
 	if lt.KeepaliveTimeout != 0 && lt.KeepaliveInterval != 0 && lt.KeepaliveTimeout <= lt.KeepaliveInterval {
 		return errors.New("link: keepalive_timeout must be longer than keepalive_interval")
+	}
+	if lt.StreamBuffer != 0 && (lt.StreamBuffer < 64<<10 || lt.StreamBuffer > link.DefaultMaxReceiveBuffer) {
+		return fmt.Errorf("link: stream_buffer %d out of range %d..%d", lt.StreamBuffer, 64<<10, link.DefaultMaxReceiveBuffer)
 	}
 
 	peers := make(map[string]*Peer)
@@ -322,8 +341,11 @@ func (c *Config) Validate(dir string) error {
 			if _, _, err := net.SplitHostPort(p.Dial); err != nil {
 				return fmt.Errorf("peer %q: dial %q: %v", p.Name, p.Dial, err)
 			}
-		} else if p.Interface != "" || p.Mark != 0 {
-			return fmt.Errorf("peer %q: interface and mark need a dial address", p.Name)
+		} else if p.Interface != "" || p.Mark != 0 || p.Congestion != "" {
+			return fmt.Errorf("peer %q: interface, mark and congestion need a dial address", p.Name)
+		}
+		if err := checkCongestion(p.Congestion); err != nil {
+			return fmt.Errorf("peer %q: %w", p.Name, err)
 		}
 		peers[p.Name] = p
 	}
@@ -530,6 +552,7 @@ func (c *Config) LinkConfig(names ...string) link.Config {
 		HandshakeTimeout:  time.Duration(c.Link.HandshakeTimeout),
 		KeepaliveInterval: time.Duration(c.Link.KeepaliveInterval),
 		KeepaliveTimeout:  time.Duration(c.Link.KeepaliveTimeout),
+		MaxStreamBuffer:   c.Link.StreamBuffer,
 	}
 }
 
@@ -625,4 +648,15 @@ func (r Rule) compile() (policy.Rule, error) {
 		}
 	}
 	return pr, nil
+}
+
+var congestionRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,14}$`)
+
+// checkCongestion accepts a kernel congestion control name or "default".
+// Whether the kernel offers it is only known when the socket is set up.
+func checkCongestion(name string) error {
+	if name == "" || name == "default" || congestionRe.MatchString(name) {
+		return nil
+	}
+	return fmt.Errorf("congestion %q: not a congestion control name", name)
 }

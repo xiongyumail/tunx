@@ -24,6 +24,9 @@ Run as root on a disposable Linux VM (Debian 13 tested target) with:
 apt install iproute2 nftables python3 python3-yaml iperf3 tcpdump ethtool
 ```
 
+The tunxd scenarios also need `openssl curl util-linux` (setpriv) and, for
+BBR, the `tcp_bbr` module.
+
 `ethtool` is optional; without it TSO/GSO stay on and netem loss applies to
 64 KB super-packets instead of single packets, which distorts loss tests.
 
@@ -264,6 +267,77 @@ The mobile segment has `delay ${mobile_delay}` (40ms) and
 `loss ${mobile_loss}` (0%). `scenarios/smoke.yaml` checks plain IP
 reachability, NAT sources, the censor, latency and throughput across the
 mobile link, runtime netem and a link cut.
+
+## tunxd end to end
+
+`topologies/two-sites-tunxd.yaml` extends two-sites with IPv6 on both LANs,
+a second relay (`exit`), an HTTPS server on `web` (the Reality target) and
+return routes on site B's router for source preservation. `tunxd/gen.py`
+writes the node configs at run time (keys from `tunxd keygen`, `xray
+x25519`), and the scenarios start tunxd (and Xray) on hub, exit, gw-a, gw-b
+and term-a:
+
+| Scenario | Links | Checks |
+|:--|:--|:--|
+| `tunxd-plain` | tunxd to tunxd, TCP 4430 | TUN created by name and set up with `tunxd check`; TCP, UDP, ping and IPv6 between the sites in both directions through the hub; `source: preserve` with and without the nft recipe; open answers (RST for a closed port, silence for a policy denial and an unreachable host); link sockets kept out of the TUN by mark and interface; ping through the hub running as `nobody` (ping sockets); failover to exit under loss and back; a short and a long link cut during a flow; SIGTERM during a flow |
+| `tunxd-xray` | Xray: VLESS + Reality to hub and exit, plain VLESS on LAN A | the same, plus Reality's camouflage and a TUN made before tunxd starts (`--premade`) |
+| `tunxd-bench` | either, with `congestion` for the link sockets | `tunxd/bench.py`: iperf3 (median of 3) and ping across the mobile segment at 0/1/3% loss, overlay and optionally raw TCP (cubic, bbr) |
+
+`run-tunxd.sh` builds tunxd and downloads and verifies Xray locally. It
+copies the simulation and verified executables to a test VM over SSH,
+runs the scenarios as root, then tears down:
+
+```
+tests/sim/run-tunxd.sh                     # tunxd-plain and tunxd-xray
+tests/sim/run-tunxd.sh bench               # throughput matrix, about 1 hour
+TUNX_SIM_HOST=testvm XRAY_PROXY=socks5h://proxy:1080 tests/sim/run-tunxd.sh tunxd-xray
+```
+
+Helpers in `tunxd/`: `status.py` checks a node's status endpoint (sessions,
+selected routes, drop counters), `tlsweb.py` is the HTTPS server, and
+`bench.py --table FILE...` validates complete matrices and prints receiver
+throughput, idle RTT, and concurrent loaded RTT/loss for each direction.
+Reported loaded averages, p95 and loss are medians of per-run summaries;
+raw outputs and every repetition remain in each JSON artifact. The client
+needs iperf3 with `--json-stream` and `--forceflush`. Loaded ping starts
+only after a positive-byte interval and a three-second warm-up from that
+evidence; recorded monotonic timestamps and iperf intervals must confirm
+that the whole ping window overlapped valid measured intervals. The default
+load duration is 30 seconds; `--duration` remains explicit when supplied.
+The sampler reserves 8 seconds for replies and a 0.5-second guard, sends
+21–55 probes 0.2 seconds apart (at least 4 seconds), and requires at least
+20 RTT replies. Insufficient budget or late replies fail the sample.
+Scheduling inputs, counts and margins are retained and revalidated.
+
+Interval timestamps remain unchanged. At most the first measured interval
+after omitted intervals may be excluded for reversed/empty timestamps or
+inconsistent duration, with its raw row and indexed warning preserved.
+Other malformed, reordered or overlapping intervals fail. At least two
+valid measured intervals and `max(5 s, duration - 2 × report interval)` of
+valid measurement coverage are required; the whole ping/reply window must
+have contiguous coverage, allowing at most 1 ms rounding gaps. A failed
+sample makes the benchmark fail, and incomplete matrices cannot pass.
+
+The local runner needs Go, SSH, curl, sha256sum and Python's zipfile module.
+`XRAY_VERSION` pins the release tag; otherwise the wrapper resolves the
+latest release locally. `XRAY_PROXY`, when supplied, is a local curl
+fallback proxy. No proxy or host configuration is changed. The local
+`run.*/xray/` directory retains the archive, official `.dgst`, tag, source
+URLs and computed SHA-256 before extraction. Only the verified executable
+and version marker are transferred; the VM does not download from GitHub.
+Download, checksum and transfer failures stop the run.
+
+The wrapper keeps local evidence under a unique `TUNX_SIM_OUT/run.*` and
+remote source files under `TUNX_SIM_DIR/run.*` and scenario evidence under
+`/run/tunx-sim/PREFIX/SCENARIO`. It holds an exclusive
+test-host lock, preserves SSH status, and fails on missing or invalid
+artifacts or copy errors. HUP, INT and TERM cancel the owned scenario
+through `tunxd/job.py`; cleanup waits for its exit before removing
+namespaces and releasing the lock. Unconfirmed cancellation retains the
+lock and evidence. It removes only its namespaces and executable
+copy. BBR must already be available; the wrapper does not load modules or
+change host configuration. Current remote acceptance and performance
+conclusions remain pending a fresh successful run.
 
 ## Troubleshooting
 

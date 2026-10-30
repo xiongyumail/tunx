@@ -33,6 +33,9 @@ const (
 	DropSpoofed    = "spoofed"
 	DropOpenFailed = "open_failed"
 	DropDeliver    = "deliver_failed"
+	// DropRefused counts flows the next hop refused (the reason is
+	// passed back toward the source).
+	DropRefused = "refused"
 )
 
 // Stats holds per-identity and per-peer counters and drop counts.

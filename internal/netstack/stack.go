@@ -74,9 +74,10 @@ type Config struct {
 	// MaxFlows bounds open flows of all protocols. New flows beyond it are
 	// dropped silently.
 	MaxFlows int
-	// TCPRejectWithReset makes a TCP flow closed before any read or write
-	// answer the SYN with RST. By default the SYN is dropped, so a refused
-	// or unreachable destination looks like a silent one.
+	// TCPRejectWithReset makes every TCP flow refused or closed before the
+	// handshake answer the SYN with RST. By default only a refusal with
+	// core.ReasonRefused does; otherwise the SYN is dropped, so an
+	// unreachable or denied destination looks like a silent one.
 	TCPRejectWithReset bool
 	// ReplyTTL is the IP TTL (hop limit) of injected echo replies.
 	ReplyTTL uint8

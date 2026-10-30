@@ -18,7 +18,10 @@ const (
 	DefaultKeepaliveInterval = 5 * time.Second
 	DefaultKeepaliveTimeout  = 15 * time.Second
 	DefaultMaxReceiveBuffer  = 16 << 20
-	DefaultMaxStreamBuffer   = 1 << 20
+	// The stream buffer is the flow-control window of one flow: about half
+	// of it is in flight, so 4 MiB allows some 200 Mbit/s at 80 ms RTT
+	// (1 MiB capped a flow at 52 Mbit/s).
+	DefaultMaxStreamBuffer = 4 << 20
 )
 
 // Limits of the wire format.
@@ -61,8 +64,8 @@ type Config struct {
 	HandshakeTimeout time.Duration
 	// KeepaliveInterval is how often a ping is sent on the control stream.
 	KeepaliveInterval time.Duration
-	// KeepaliveTimeout closes the session when no pong has arrived for this
-	// long.
+	// KeepaliveTimeout closes after this long without an underlying
+	// transport read returning bytes. Checks run every max(timeout/8, 1 ms).
 	KeepaliveTimeout time.Duration
 
 	// MaxReceiveBuffer and MaxStreamBuffer size the multiplexer buffers for
@@ -77,6 +80,18 @@ type Config struct {
 
 	// Logger receives session events. Nil discards them.
 	Logger *slog.Logger
+
+	// maxVersion caps the offered protocol version (tests only); zero
+	// means ProtocolVersion.
+	maxVersion uint8
+}
+
+// highest returns the highest protocol version this end speaks.
+func (c *Config) highest() uint8 {
+	if c.maxVersion != 0 {
+		return c.maxVersion
+	}
+	return ProtocolVersion
 }
 
 func (c Config) withDefaults() Config {

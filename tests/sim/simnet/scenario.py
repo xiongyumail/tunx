@@ -317,24 +317,29 @@ class Run:
             self.r.do(sp)
             self.r.capture(self.ns(a["from"]), shlex.join(cmd), 0)
             return "dry", "", "", None
-        p = self.r.spawn(sp)
-        try:
-            ready = False
-            for _ in range(50):
-                rc, _, _, _ = self.r.capture(server.ns, f"ss -Hltn 'sport = :{port}' | grep -q .", 3)
-                if rc == 0:
-                    ready = True
-                    break
-                time.sleep(0.1)
-            if not ready:
-                return "fail", f"iperf3 server on {server.name}:{port} did not start (see {sp.log})", "", None
-            rc, out, timed_out, _ = self.r.capture(self.ns(a["from"]), shlex.join(cmd), a.get("timeout", dur + 20))
-        finally:
+        # On a lossy path the control connection can miss iperf3's connect
+        # timeout; try once more with a fresh server.
+        for attempt in (1, 2):
+            p = self.r.spawn(sp)
             try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            p.wait()
+                ready = False
+                for _ in range(50):
+                    rc, _, _, _ = self.r.capture(server.ns, f"ss -Hltn 'sport = :{port}' | grep -q .", 3)
+                    if rc == 0:
+                        ready = True
+                        break
+                    time.sleep(0.1)
+                if not ready:
+                    return "fail", f"iperf3 server on {server.name}:{port} did not start (see {sp.log})", "", None
+                rc, out, timed_out, _ = self.r.capture(self.ns(a["from"]), shlex.join(cmd), a.get("timeout", dur + 20))
+            finally:
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+            if "unable to connect" not in out:
+                break
         res = {"type": "iperf3", "proto": proto, "from": a["from"], "to": a["to"], "port": port,
                "duration_s": dur, "reverse": bool(a.get("reverse"))}
         try:

@@ -43,7 +43,7 @@ func Keep(ctx context.Context, dial func(context.Context) (net.Conn, error), cfg
 			return ctx.Err()
 		}
 		wait := backoff/2 + rand.N(backoff/2+1)
-		log.Warn("link: redialing", "err", err, "in", wait)
+		log.Warn("link: redialing", "err", err, "in", wait.Round(time.Millisecond).String())
 		t := time.NewTimer(wait)
 		select {
 		case <-t.C:

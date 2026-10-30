@@ -109,6 +109,52 @@ func TestTCPRefusedFlowGetsNoSynAck(t *testing.T) {
 	}
 }
 
+// Only a refusal by the destination answers the SYN with RST; every other
+// reason leaves it unanswered. An explicit Accept completes the handshake.
+func TestTCPRefuseReasons(t *testing.T) {
+	for _, tc := range []struct {
+		reason core.Reason // 0: accept
+		want   header.TCPFlags
+	}{
+		{core.ReasonRefused, header.TCPFlagRst},
+		{core.ReasonDenied, 0},
+		{core.ReasonUnreachable, 0},
+		{core.ReasonNoRoute, 0},
+		{core.ReasonError, 0},
+		{0, header.TCPFlagSyn | header.TCPFlagAck},
+	} {
+		accepted := make(chan error, 1)
+		h := core.HandlerFunc(func(ctx context.Context, meta core.FlowMeta, f core.Flow, in core.Ingress) {
+			defer f.Close()
+			if tc.reason == 0 {
+				accepted <- core.Accept(f)
+				<-ctx.Done()
+				return
+			}
+			core.Refuse(f, tc.reason)
+		})
+		_, ep := newTestStack(t, h, nil)
+		src, dst := netip.AddrPortFrom(client4, 40002), netip.MustParseAddrPort("198.18.0.1:82")
+		inject(ep, tcpPacket(src, dst, 1000, 0, header.TCPFlagSyn, nil))
+		if tc.want == 0 {
+			expectNothing(t, ep, 300*time.Millisecond)
+			continue
+		}
+		p := expectPacket(t, ep, header.TCPProtocolNumber)
+		seg := header.TCP(p.l4)
+		if f := seg.Flags(); !f.Contains(tc.want) {
+			t.Fatalf("reason %v: flags %v, want %v", tc.reason, f, tc.want)
+		}
+		if tc.reason == 0 {
+			// Accept returns once the handshake is complete.
+			inject(ep, tcpPacket(src, dst, 1001, seg.SequenceNumber()+1, header.TCPFlagAck, nil))
+			if err := <-accepted; err != nil {
+				t.Fatalf("accept: %v", err)
+			}
+		}
+	}
+}
+
 func TestUDP(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

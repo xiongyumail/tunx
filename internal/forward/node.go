@@ -88,7 +88,8 @@ func Start(cfg *config.Config, opts Options) (*Node, error) {
 		return nil, err
 	}
 	for _, l := range cfg.Listen {
-		ln, err := net.Listen("tcp", l.Address)
+		lc := net.ListenConfig{Control: sockopts("", 0, l.Congestion)}
+		ln, err := lc.Listen(context.Background(), "tcp", l.Address)
 		if err != nil {
 			return fail(fmt.Errorf("listen %s: %w", l.Address, err))
 		}
@@ -135,7 +136,7 @@ func Start(cfg *config.Config, opts Options) (*Node, error) {
 			continue
 		}
 		lc := cfg.LinkConfig(p.Name)
-		lc.Logger = linkLog.With("peer", p.Name)
+		lc.Logger = linkLog.With("dial", p.Name) // sessions log the authenticated peer
 		dial := func(ctx context.Context) (net.Conn, error) {
 			if opts.Dial != nil {
 				return opts.Dial(ctx, p)
@@ -185,32 +186,48 @@ func (n *Node) acceptLoop(ln net.Listener, lc link.Config) {
 }
 
 // dialPeer connects to the peer's dial address, bound to its interface and
-// mark when configured.
+// mark and with its congestion control when configured.
 func dialPeer(ctx context.Context, p config.Peer) (net.Conn, error) {
-	d := net.Dialer{Timeout: 10 * time.Second}
-	if p.Interface != "" || p.Mark != 0 {
-		d.Control = func(_, _ string, rc syscall.RawConn) error {
-			var serr error
-			err := rc.Control(func(fd uintptr) {
-				if p.Interface != "" {
-					if serr = unix.BindToDevice(int(fd), p.Interface); serr != nil {
-						serr = fmt.Errorf("bind to device %q: %w", p.Interface, serr)
-						return
-					}
-				}
-				if p.Mark != 0 {
-					if serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(p.Mark)); serr != nil {
-						serr = fmt.Errorf("set mark %#x: %w", p.Mark, serr)
-					}
-				}
-			})
-			if err != nil {
-				return err
-			}
-			return serr
-		}
-	}
+	d := net.Dialer{Timeout: 10 * time.Second, Control: sockopts(p.Interface, p.Mark, p.Congestion)}
 	return d.DialContext(ctx, "tcp", p.Dial)
+}
+
+// sockopts returns a socket Control function applying the interface, mark
+// and congestion control that are set, or nil when none is. Accepted
+// connections inherit the congestion control of their listener.
+func sockopts(iface string, mark uint32, congestion string) func(string, string, syscall.RawConn) error {
+	if congestion == "default" {
+		congestion = ""
+	}
+	if iface == "" && mark == 0 && congestion == "" {
+		return nil
+	}
+	return func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		err := rc.Control(func(fd uintptr) {
+			if iface != "" {
+				if serr = unix.BindToDevice(int(fd), iface); serr != nil {
+					serr = fmt.Errorf("bind to device %q: %w", iface, serr)
+					return
+				}
+			}
+			if mark != 0 {
+				if serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(mark)); serr != nil {
+					serr = fmt.Errorf("set mark %#x: %w", mark, serr)
+					return
+				}
+			}
+			if congestion != "" {
+				if serr = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, congestion); serr != nil {
+					serr = fmt.Errorf("congestion %q (see net.ipv4.tcp_available_congestion_control): %w", congestion, serr)
+				}
+			}
+		})
+		if err != nil {
+			return err
+		}
+		return serr
+	}
 }
 
 // Forwarder returns the node's forwarder (for injecting flows in tests).
