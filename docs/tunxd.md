@@ -12,7 +12,7 @@ pull rendered configuration; applying updates without restarting comes later.
 ```
 tunxd keygen                 print a new key pair (JSON: private_key, public_key)
 tunxd check -c config.json   validate a config, print the public key and the TUN setup
-tunxd run -c config.json     run the node until SIGTERM or SIGINT
+tunxd run -c config.json [-pull-interval 30s -hub-dir DIR]
 tunxd enroll -hub URL -token-file FILE [-dir DIR]
 tunxd pull [-dir DIR]
 ```
@@ -28,6 +28,13 @@ The token file may be `-` to read stdin. Plain HTTP is accepted only for a
 loopback hub. `pull` sends the saved ETag and leaves the files untouched on
 304; a changed bundle is validated before its two config files are replaced.
 The node token and private key are never printed.
+
+With `-pull-interval`, `run` keeps serving the last good configuration when
+the hub is unavailable. Changes to routes, policy, groups and hop limit are
+applied to new flows without closing existing flows or link sessions. The
+new Xray file is written but not reloaded. Changes to identity, keys, TUN,
+addresses, peers, listeners, link timers, status or logging are kept on disk
+and logged as requiring a restart.
 
 ## How a flow is handled
 

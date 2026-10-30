@@ -16,7 +16,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/xiongyumail/tunx/internal/config"
 	"github.com/xiongyumail/tunx/internal/forward"
@@ -54,7 +56,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		file := fs.String("c", "/etc/tunx/tunxd.json", "config file")
+		var pullInterval *time.Duration
+		var hubDir *string
+		if args[0] == "run" {
+			pullInterval = fs.Duration("pull-interval", 0, "hub config polling interval (0 disables)")
+			hubDir = fs.String("hub-dir", "/etc/tunx", "directory containing hub.json")
+		}
 		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		if pullInterval != nil && (*pullInterval < 0 || (*pullInterval > 0 && *pullInterval < time.Second)) {
+			fmt.Fprintln(stderr, "tunxd: pull-interval must be 0 or at least 1s")
 			return 2
 		}
 		cfg, err := config.Load(*file)
@@ -65,7 +77,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		if args[0] == "check" {
 			return check(cfg, stdout)
 		}
-		return serve(ctx, cfg, stderr)
+		return serve(ctx, cfg, *file, *pullInterval, *hubDir, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprint(stdout, usage)
 		return 0
@@ -112,7 +124,7 @@ func check(cfg *config.Config, w io.Writer) int {
 	return 0
 }
 
-func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) int {
+func serve(ctx context.Context, cfg *config.Config, file string, pullInterval time.Duration, hubDir string, stderr io.Writer) int {
 	level, _ := cfg.Level()
 	log := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{Level: level}))
 	n, err := forward.Start(cfg, forward.Options{Logger: log})
@@ -120,7 +132,45 @@ func serve(ctx context.Context, cfg *config.Config, stderr io.Writer) int {
 		log.Error("start failed", "err", err)
 		return 1
 	}
-	<-ctx.Done()
+	var ticks <-chan time.Time
+	var ticker *time.Ticker
+	if pullInterval > 0 {
+		ticker = time.NewTicker(pullInterval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			goto stop
+		case <-ticks:
+			state, err := loadState(hubDir)
+			if err != nil {
+				log.Warn("config pull failed", "err", err)
+				continue
+			}
+			changed, revision, err := pullConfig(ctx, hubDir, state)
+			if err != nil {
+				log.Warn("config pull failed", "err", err)
+				continue
+			}
+			if !changed {
+				continue
+			}
+			nextFile := filepath.Join(hubDir, tunxdFile)
+			next, err := config.Load(nextFile)
+			if err == nil {
+				err = n.Reload(next)
+			}
+			if err != nil {
+				log.Warn("config downloaded; restart required", "revision", revision, "config", nextFile, "err", err)
+				continue
+			}
+			log.Info("tunxd config reloaded; xray config updated on disk", "revision", revision, "config", nextFile, "started_with", file)
+		}
+	}
+
+stop:
 	log.Info("shutting down")
 	n.Close()
 	return 0

@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -74,6 +75,29 @@ func TestTCPAcrossLink(t *testing.T) {
 	}
 	if p := b.Status().Stats.Peers["a"]; p.RxBytes != uint64(len(payload)) {
 		t.Fatalf("peer counters on b %+v", p)
+	}
+}
+
+func TestReloadRoutesAndRejectStaticChange(t *testing.T) {
+	k := newKeys(t, "a")
+	cfg := baseConfig(k, "a")
+	cfg.Routes = []config.Route{localRoute("127.0.1.0/24", "a")}
+	n := startNode(t, cfg, newRecorder(), Options{})
+
+	next := *cfg
+	next.Routes = []config.Route{localRoute("127.0.2.0/24", "a")}
+	next.Policy = []config.Rule{{Action: "allow", Dst: []netip.Prefix{netip.MustParsePrefix("127.0.2.0/24")}}}
+	if err := n.Reload(&next); err != nil {
+		t.Fatal(err)
+	}
+	if n.Router().Table().Lookup(netip.MustParseAddr("127.0.1.1")) != nil || n.Router().Table().Lookup(netip.MustParseAddr("127.0.2.1")) == nil {
+		t.Fatal("route table was not replaced")
+	}
+
+	restart := next
+	restart.Listen = []config.Listener{{Address: "127.0.0.1:1"}}
+	if !errors.Is(n.Reload(&restart), ErrRestartRequired) {
+		t.Fatal("listener change did not require restart")
 	}
 }
 

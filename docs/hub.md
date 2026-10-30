@@ -162,10 +162,10 @@ the `vless://` share link.
 `tunxd enroll` and `tunxd pull` implement the one-time enrolment and ETag
 config download. The remaining node-side work is:
 
-1. **Reload.** Poll the hub, then apply a new config without dropping flows:
-   reload Xray, swap the route
-   table and policy (route tables are already swapped atomically), add and
-   remove peers and listeners, keep sessions to unchanged peers.
+1. **Full reload.** Polling plus route, policy, group and hop-limit reload
+   are implemented. The remaining work is to reload Xray, add and remove
+   peers and listeners, and keep sessions to unchanged peers. Those changes
+   currently write the new files and require a tunxd restart.
 2. **Client identity.** A `client_socks` section (`listen`, `users[]` with
    `name` and `password`): a SOCKS5 server with username/password auth,
    CONNECT and UDP ASSOCIATE, that injects flows with `Identity` = the

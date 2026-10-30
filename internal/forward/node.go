@@ -2,12 +2,14 @@ package forward
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +22,10 @@ import (
 	"github.com/xiongyumail/tunx/internal/netstack"
 	"github.com/xiongyumail/tunx/internal/route"
 )
+
+// ErrRestartRequired means a new config changes resources that cannot yet be
+// replaced without restarting the node.
+var ErrRestartRequired = errors.New("forward: config change requires restart")
 
 // Options adjust a Node beyond its config, mostly for tests.
 type Options struct {
@@ -238,6 +244,33 @@ func (n *Node) Sessions() *Sessions { return n.sessions }
 
 // Router returns the route table holder.
 func (n *Node) Router() *route.Router { return n.router }
+
+// Reload applies routing, policy, groups and hop-limit changes to new flows.
+// Listeners, peers, keys, TUN and status resources still require a restart.
+func (n *Node) Reload(cfg *config.Config) error {
+	if cfg.Key() == nil {
+		return errors.New("forward: config not validated (no private key)")
+	}
+	oldStatic, newStatic := *n.cfg, *cfg
+	oldStatic.Groups, newStatic.Groups = nil, nil
+	oldStatic.Routes, newStatic.Routes = nil, nil
+	oldStatic.Policy, newStatic.Policy = nil, nil
+	oldStatic.HopLimit, newStatic.HopLimit = 0, 0
+	if !reflect.DeepEqual(oldStatic, newStatic) || subtle.ConstantTimeCompare(n.cfg.Key(), cfg.Key()) != 1 {
+		return ErrRestartRequired
+	}
+	table, err := cfg.Table()
+	if err != nil {
+		return err
+	}
+	pol, err := cfg.BuildPolicy()
+	if err != nil {
+		return err
+	}
+	n.fwd.Reload(table, pol, uint8(cfg.HopLimit))
+	n.log.Info("node config reloaded", "routes", len(cfg.Routes), "policy", len(cfg.Policy), "hop_limit", cfg.HopLimit)
+	return nil
+}
 
 // ListenAddrs returns the addresses link listeners are bound to.
 func (n *Node) ListenAddrs() []net.Addr {

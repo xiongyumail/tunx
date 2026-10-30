@@ -10,7 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xiongyumail/tunx/internal/core"
@@ -34,13 +33,15 @@ const answerTimeout = 20 * time.Second
 // Forwarder implements core.Handler for a node.
 type Forwarder struct {
 	self     string
-	hopLimit uint8
 	router   *route.Router
-	policy   atomic.Pointer[policy.Policy]
 	sessions *Sessions
 	stats    *Stats
 	deliver  DeliverFunc
 	log      *slog.Logger
+
+	configMu sync.RWMutex
+	hopLimit uint8
+	policy   *policy.Policy
 }
 
 // NewForwarder returns a forwarder for node self.
@@ -59,16 +60,23 @@ func NewForwarder(self string, hopLimit uint8, router *route.Router, pol *policy
 		stats:    NewStats(),
 		deliver:  deliver,
 		log:      log,
+		policy:   pol,
 	}
-	f.policy.Store(pol)
 	return f
 }
 
 // Stats returns the counters.
 func (fw *Forwarder) Stats() *Stats { return fw.stats }
 
-// SetPolicy replaces the access policy.
-func (fw *Forwarder) SetPolicy(p *policy.Policy) { fw.policy.Store(p) }
+// Reload atomically replaces the route, policy and hop limit used by new
+// flows. Existing flows keep the decision made when they started.
+func (fw *Forwarder) Reload(table *route.Table, p *policy.Policy, hopLimit uint8) {
+	fw.configMu.Lock()
+	fw.router.Store(table)
+	fw.policy = p
+	fw.hopLimit = hopLimit
+	fw.configMu.Unlock()
+}
 
 // HandleFlow routes one flow and returns when it is finished.
 //
@@ -79,7 +87,11 @@ func (fw *Forwarder) SetPolicy(p *policy.Policy) { fw.policy.Store(p) }
 // their next-hop stream opens, without confirming downstream delivery.
 func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.Flow, in core.Ingress) {
 	defer f.Close()
-	pol := fw.policy.Load()
+	fw.configMu.RLock()
+	pol := fw.policy
+	table := fw.router.Table()
+	hopLimit := fw.hopLimit
+	fw.configMu.RUnlock()
 	switch in.Kind {
 	case "tun":
 		meta.Identity = fw.self
@@ -97,12 +109,12 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 			return
 		}
 	}
-	if int(meta.Hops) > int(fw.hopLimit) {
+	if int(meta.Hops) > int(hopLimit) {
 		fw.drop(DropHopLimit, meta, in, f)
 		return
 	}
 
-	_, next := fw.router.Table().Resolve(meta.Dst.Addr(), fw.sessions.Up)
+	_, next := table.Resolve(meta.Dst.Addr(), fw.sessions.Up)
 	if len(next) > 0 && next[0].Local {
 		// Delivering node: the access policy applies here.
 		if !pol.Allow(meta) {
@@ -117,7 +129,7 @@ func (fw *Forwarder) HandleFlow(ctx context.Context, meta core.FlowMeta, f core.
 		fw.drop(DropDenied, meta, in, f)
 		return
 	}
-	if int(meta.Hops)+1 > int(fw.hopLimit) {
+	if int(meta.Hops)+1 > int(hopLimit) {
 		fw.drop(DropHopLimit, meta, in, f)
 		return
 	}
