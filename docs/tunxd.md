@@ -5,7 +5,7 @@
 routes every flow by destination prefix (`internal/route`), checks the access
 policy (`internal/policy`) and either forwards the flow over a link or
 delivers it on this host (`internal/egress`). It can enrol with tunx-hub and
-pull rendered configuration; applying updates without restarting comes later.
+poll and partially apply rendered configuration without restarting.
 
 ## Commands
 
@@ -110,6 +110,7 @@ JSON; `//` and `/* */` comments are allowed, unknown fields are errors. See
 | `link` | `handshake_timeout`, `keepalive_interval`, `keepalive_timeout` (`"5s"`); `stream_buffer`: per-flow window in bytes (default 4 MiB, about 200 Mbit/s for one flow at 80 ms RTT; smaller bounds how much one bulk flow queues ahead of others on a slow link) |
 | `status` | Loopback address of the status endpoint; empty disables it |
 | `log_level` | `debug`, `info` (default), `warn`, `error` |
+| `client_socks` | Authenticated loopback SOCKS5 ingress: `listen`, and `users[]` with `name` and `password`. TCP CONNECT is injected with the username as its policy identity; UDP ASSOCIATE is not yet supported |
 
 Identity patterns use shell glob syntax (`site-*`).
 

@@ -150,12 +150,12 @@ routes each client user to its own SOCKS outbound `client-<name>` that
 connects to tunxd's local SOCKS server (`client_listen`, default
 127.0.0.1:7701) with username = client name and the client's generated
 password. tunxd authenticates the account, takes the identity from the
-username and the destination from the SOCKS request (CONNECT for TCP, UDP
-ASSOCIATE for UDP), and handles the flow as if it entered from the TUN with
-that identity. The accounts are rendered in the bundle's `client_socks`
-section. Egress `xray_rules` of policies that match a client are applied to
-its traffic before this hand-over. `GET /api/clients/{name}/share` returns
-the `vless://` share link.
+username and the destination from the SOCKS request, and handles TCP CONNECT
+as a client flow with `Hops` = 0. UDP ASSOCIATE is not yet supported. The
+accounts are rendered both in `tunxd.client_socks` and at bundle level for
+older consumers. Egress `xray_rules` of policies that match a client are
+applied before this hand-over. `GET /api/clients/{name}/share` returns the
+`vless://` share link.
 
 ### What tunxd must add
 
@@ -166,11 +166,8 @@ config download. The remaining node-side work is:
    are implemented. The remaining work is to reload Xray, add and remove
    peers and listeners, and keep sessions to unchanged peers. Those changes
    currently write the new files and require a tunxd restart.
-2. **Client identity.** A `client_socks` section (`listen`, `users[]` with
-   `name` and `password`): a SOCKS5 server with username/password auth,
-   CONNECT and UDP ASSOCIATE, that injects flows with `Identity` = the
-   username and `Hops` = 0. Until then the section lives beside the tunxd
-   config in the bundle.
+2. **Client UDP.** Authenticated SOCKS5 TCP CONNECT and identity injection
+   are implemented. UDP ASSOCIATE remains.
 3. Optional: several `dial` addresses per peer, to use standby links.
 
 ## REST API
@@ -208,7 +205,7 @@ The bundle:
 {
   "node": "site-a",
   "revision": "33e5813…",
-  "tunxd": { "node": "site-a", "private_key_file": "node.key", "peers": […], "routes": […], "policy": […] },
+  "tunxd": { "node": "site-a", "private_key_file": "node.key", "peers": […], "routes": […], "policy": […], "client_socks": {…} },
   "xray": { "inbounds": […], "outbounds": […], "routing": {…} },
   "client_socks": { "listen": "127.0.0.1:7701", "users": [{"name": "phone", "password": "…"}] },
   "warnings": ["link \"b-hub\": node \"site-b\" is not enrolled; link skipped"]

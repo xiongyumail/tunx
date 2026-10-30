@@ -101,6 +101,56 @@ func TestReloadRoutesAndRejectStaticChange(t *testing.T) {
 	}
 }
 
+func TestClientSOCKSConnect(t *testing.T) {
+	k := newKeys(t, "edge")
+	cfg := baseConfig(k, "edge")
+	cfg.ClientSOCKS = &config.ClientSOCKS{
+		Listen: "127.0.0.1:0",
+		Users:  []config.SOCKSUser{{Name: "phone", Password: "secret"}},
+	}
+	cfg.Routes = []config.Route{localRoute("127.0.1.0/24", "edge")}
+	rec := newRecorder()
+	n := startNode(t, cfg, rec, Options{})
+	srv := newCountServer(t, "127.0.1.1")
+
+	c, err := net.DialTCP("tcp4", nil, n.ClientAddr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte{5, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	var reply [10]byte
+	if _, err := io.ReadFull(c, reply[:2]); err != nil || !bytes.Equal(reply[:2], []byte{5, 2}) {
+		t.Fatalf("method reply % x, %v", reply[:2], err)
+	}
+	auth := append([]byte{1, 5}, []byte("phone")...)
+	auth = append(auth, 6)
+	auth = append(auth, []byte("secret")...)
+	if _, err := c.Write(auth); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, reply[:2]); err != nil || !bytes.Equal(reply[:2], []byte{1, 0}) {
+		t.Fatalf("auth reply % x, %v", reply[:2], err)
+	}
+	dst := srv.addr()
+	ip := dst.Addr().As4()
+	req := []byte{5, 1, 0, 1, ip[0], ip[1], ip[2], ip[3], byte(dst.Port() >> 8), byte(dst.Port())}
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(c, reply[:]); err != nil || reply[1] != 0 {
+		t.Fatalf("connect reply % x, %v", reply, err)
+	}
+	if got := tcpExchange(t, c, []byte("hello")); got != "n=5" {
+		t.Fatalf("got %q", got)
+	}
+	if d := rec.next(t); d.meta.Identity != "phone" || d.meta.Dst != dst || d.meta.Hops != 0 {
+		t.Fatalf("delivered %+v", d)
+	}
+}
+
 func TestUDPAcrossLink(t *testing.T) {
 	rec := newRecorder()
 	a, _ := twoNodes(t, rec, nil)

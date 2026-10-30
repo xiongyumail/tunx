@@ -1,6 +1,6 @@
 {
   "node": "hub",
-  "revision": "d80be60f28d1014054dfb5db",
+  "revision": "f817e3102b03155238ab723c",
   "tunxd": {
     "node": "hub",
     "network": "example",
@@ -166,7 +166,16 @@
         ]
       }
     ],
-    "status": "127.0.0.1:7790"
+    "status": "127.0.0.1:7790",
+    "client_socks": {
+      "listen": "127.0.0.1:7701",
+      "users": [
+        {
+          "name": "phone",
+          "password": "ukeHnOSm71per9F6iph68NQq"
+        }
+      ]
+    }
   },
   "xray": {
     "inbounds": [

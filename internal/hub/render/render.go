@@ -35,23 +35,10 @@ type Bundle struct {
 	Revision string         `json:"revision"`
 	Tunxd    *config.Config `json:"tunxd"`
 	Xray     map[string]any `json:"xray"`
-	// ClientSOCKS is the local SOCKS server tunxd must run for standard
-	// clients attached to this node (not yet in the tunxd config).
-	ClientSOCKS *ClientSOCKS `json:"client_socks,omitempty"`
-	Warnings    []string     `json:"warnings,omitempty"`
-}
-
-// ClientSOCKS lists the per-client accounts of the local SOCKS server. A
-// connection authenticated as Name carries the identity Name.
-type ClientSOCKS struct {
-	Listen string      `json:"listen"`
-	Users  []SOCKSUser `json:"users"`
-}
-
-// SOCKSUser is one client account.
-type SOCKSUser struct {
-	Name     string `json:"name"`
-	Password string `json:"password"`
+	// ClientSOCKS is kept at bundle level for older consumers. The same
+	// section is also present in Tunxd, where the daemon reads it.
+	ClientSOCKS *config.ClientSOCKS `json:"client_socks,omitempty"`
+	Warnings    []string            `json:"warnings,omitempty"`
 }
 
 type renderer struct {
@@ -89,7 +76,9 @@ func Node(s *model.Spec, name string) (*Bundle, error) {
 	if err != nil {
 		return nil, err
 	}
-	b := &Bundle{Node: name, Tunxd: tc, Xray: r.xray(), ClientSOCKS: r.clientSOCKS()}
+	cs := r.clientSOCKS()
+	tc.ClientSOCKS = cs
+	b := &Bundle{Node: name, Tunxd: tc, Xray: r.xray(), ClientSOCKS: cs}
 	if err := checkTunxd(tc); err != nil {
 		return nil, fmt.Errorf("node %q: rendered tunxd config is invalid: %w", name, err)
 	}
@@ -538,14 +527,14 @@ func (r *renderer) policy(routes []config.Route) ([]config.Rule, map[string][]st
 	return rules, groups
 }
 
-func (r *renderer) clientSOCKS() *ClientSOCKS {
+func (r *renderer) clientSOCKS() *config.ClientSOCKS {
 	cs := r.clientsOf(r.self.Name)
 	if len(cs) == 0 {
 		return nil
 	}
-	out := &ClientSOCKS{Listen: cmp.Or(r.self.ClientListen, model.DefaultClientListen)}
+	out := &config.ClientSOCKS{Listen: cmp.Or(r.self.ClientListen, model.DefaultClientListen)}
 	for _, c := range cs {
-		out.Users = append(out.Users, SOCKSUser{Name: c.Name, Password: c.Password})
+		out.Users = append(out.Users, config.SOCKSUser{Name: c.Name, Password: c.Password})
 	}
 	return out
 }

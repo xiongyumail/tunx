@@ -55,8 +55,23 @@ type Config struct {
 	// disables it.
 	Status   string `json:"status,omitempty"`
 	LogLevel string `json:"log_level,omitempty"`
+	// ClientSOCKS accepts standard SOCKS5 clients handed over by the local
+	// transport proxy. Each account becomes the flow identity.
+	ClientSOCKS *ClientSOCKS `json:"client_socks,omitempty"`
 
 	key ed25519.PrivateKey
+}
+
+// ClientSOCKS configures the local authenticated SOCKS5 ingress.
+type ClientSOCKS struct {
+	Listen string      `json:"listen"`
+	Users  []SOCKSUser `json:"users"`
+}
+
+// SOCKSUser is one client identity and its password.
+type SOCKSUser struct {
+	Name     string `json:"name"`
+	Password string `json:"password"`
 }
 
 // TUN configures the capture device. tunxd creates it but does not assign
@@ -309,6 +324,27 @@ func (c *Config) Validate(dir string) error {
 	if c.Status != "" {
 		if err := checkLoopback(c.Status); err != nil {
 			return fmt.Errorf("status: %w", err)
+		}
+	}
+	if cs := c.ClientSOCKS; cs != nil {
+		if err := checkLoopback(cs.Listen); err != nil {
+			return fmt.Errorf("client_socks.listen: %w", err)
+		}
+		if len(cs.Users) == 0 {
+			return errors.New("client_socks.users: at least one user is required")
+		}
+		seen := make(map[string]bool, len(cs.Users))
+		for i, u := range cs.Users {
+			if err := checkName(fmt.Sprintf("client_socks.users[%d].name", i), u.Name); err != nil {
+				return err
+			}
+			if seen[u.Name] {
+				return fmt.Errorf("client_socks.users[%d]: duplicate user %q", i, u.Name)
+			}
+			seen[u.Name] = true
+			if len(u.Name) > 255 || len(u.Password) == 0 || len(u.Password) > 255 {
+				return fmt.Errorf("client_socks.users[%d].password: must be 1..255 bytes", i)
+			}
 		}
 	}
 	if _, err := c.Level(); err != nil {

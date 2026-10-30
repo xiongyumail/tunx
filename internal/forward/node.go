@@ -55,6 +55,7 @@ type Node struct {
 	wg     sync.WaitGroup
 
 	listeners []net.Listener
+	clientLn  net.Listener
 	stack     *netstack.Stack
 	status    *http.Server
 	statusLn  net.Listener
@@ -102,6 +103,11 @@ func Start(cfg *config.Config, opts Options) (*Node, error) {
 		n.listeners = append(n.listeners, ln)
 	}
 	n.listeners = append(n.listeners, opts.Listeners...)
+	if cfg.ClientSOCKS != nil {
+		if err := n.startClientSOCKS(cfg.ClientSOCKS); err != nil {
+			return fail(fmt.Errorf("client SOCKS listen %s: %w", cfg.ClientSOCKS.Listen, err))
+		}
+	}
 	if cfg.Status != "" {
 		ln, err := net.Listen("tcp", cfg.Status)
 		if err != nil {
@@ -281,6 +287,14 @@ func (n *Node) ListenAddrs() []net.Addr {
 	return out
 }
 
+// ClientAddr returns the local SOCKS5 ingress address, or nil when disabled.
+func (n *Node) ClientAddr() net.Addr {
+	if n.clientLn == nil {
+		return nil
+	}
+	return n.clientLn.Addr()
+}
+
 // StatusAddr returns the status endpoint address, or nil.
 func (n *Node) StatusAddr() net.Addr {
 	if n.statusLn == nil {
@@ -299,6 +313,9 @@ func (n *Node) Close() error {
 		n.cancel()
 		for _, ln := range n.listeners {
 			ln.Close()
+		}
+		if n.clientLn != nil {
+			n.clientLn.Close()
 		}
 		if n.status != nil {
 			n.status.Close()
