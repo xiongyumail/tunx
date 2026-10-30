@@ -57,7 +57,7 @@ export const api = {
   put: (kind, name, obj) => request('PUT', `/api/${kind}/${enc(name)}`, { body: obj }),
   remove: (kind, name) => request('DELETE', `/api/${kind}/${enc(name)}`),
   exportYAML: () => request('GET', '/api/export', { text: true }),
-  importYAML: (yaml) => request('POST', '/api/import', { raw: yaml }),
+  importYAML: (yaml, dryRun = false) => request('POST', `/api/import${dryRun ? '?dry_run=1' : ''}`, { raw: yaml }),
   audit: (limit) => request('GET', `/api/audit?limit=${limit}`),
   tokens: () => request('GET', '/api/tokens'),
   createToken: (name) => request('POST', '/api/tokens', { body: { name } }),

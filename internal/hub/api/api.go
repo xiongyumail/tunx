@@ -454,6 +454,23 @@ func (s *Server) importYAML(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	if r.URL.Query().Get("dry_run") == "1" {
+		changes, err := s.Store.PreviewImport(r.Context(), spec)
+		var ve *store.ValidationError
+		if errors.As(err, &ve) {
+			writeError(w, 400, err.Error())
+			return
+		}
+		if err != nil {
+			s.internal(w, err)
+			return
+		}
+		if changes == nil {
+			changes = []store.Change{}
+		}
+		writeJSON(w, 200, updateResult{Changes: changes})
+		return
+	}
 	s.update(w, r, func(cur *model.Spec) error { *cur = *spec; return nil }, nil)
 }
 

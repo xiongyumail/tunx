@@ -11,6 +11,7 @@ const current = ref('')
 const text = ref('')
 const loading = ref(false)
 const busy = ref(false)
+const previewing = ref(false)
 const preview = ref(null)
 const result = ref(null)
 const fileInput = ref(null)
@@ -32,16 +33,21 @@ const dirty = computed(() => text.value !== current.value)
 
 async function openPreview() {
   // Compare against what the hub has now, not what was loaded earlier.
+  previewing.value = true
   try {
-    current.value = await api.exportYAML()
+    const [latest, checked] = await Promise.all([api.exportYAML(), api.importYAML(text.value, true)])
+    current.value = latest
+    const ops = diffLines(current.value, text.value)
+    preview.value = {
+      lines: hunks(ops),
+      added: ops.filter((o) => o.t === '+').length,
+      removed: ops.filter((o) => o.t === '-').length,
+      changes: checked.changes || [],
+    }
   } catch (e) {
-    return ui.message.error(e.message)
-  }
-  const ops = diffLines(current.value, text.value)
-  preview.value = {
-    lines: hunks(ops),
-    added: ops.filter((o) => o.t === '+').length,
-    removed: ops.filter((o) => o.t === '-').length,
+    ui.message.error({ content: e.message, duration: 8 })
+  } finally {
+    previewing.value = false
   }
 }
 
@@ -84,7 +90,7 @@ const actionColor = { create: 'green', update: 'blue', delete: 'red' }
         <a-button :loading="loading" @click="load"><CloudDownloadOutlined />{{ isMobile ? '' : t('yaml.reload') }}</a-button>
         <a-button @click="pick"><FolderOpenOutlined />{{ isMobile ? '' : t('yaml.open') }}</a-button>
         <a-button @click="save"><DownloadOutlined />{{ isMobile ? '' : t('c.download') }}</a-button>
-        <a-button type="primary" data-test="preview" @click="openPreview"><DiffOutlined />{{ t('yaml.preview') }}</a-button>
+        <a-button type="primary" data-test="preview" :loading="previewing" @click="openPreview"><DiffOutlined />{{ t('yaml.preview') }}</a-button>
         <input ref="fileInput" type="file" accept=".yaml,.yml,text/yaml,application/yaml" hidden @change="onFile" />
       </div>
     </div>
@@ -124,6 +130,9 @@ const actionColor = { create: 'green', update: 'blue', delete: 'red' }
       @cancel="preview = null"
     >
       <template v-if="preview">
+        <div v-if="preview.changes.length" class="tags" style="margin-bottom: 12px">
+          <a-tag v-for="c in preview.changes" :key="c.kind + c.name" :color="actionColor[c.action]">{{ c.action }} {{ c.kind }}/{{ c.name }}</a-tag>
+        </div>
         <p v-if="!preview.added && !preview.removed" class="hint">{{ t('yaml.same') }}</p>
         <template v-else>
           <p class="hint" style="margin-bottom: 8px">{{ t('yaml.lines', { a: preview.added, r: preview.removed }) }}</p>

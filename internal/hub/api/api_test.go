@@ -360,6 +360,13 @@ func TestImportExport(t *testing.T) {
 	}
 	// A real change is applied and audited.
 	changed := strings.Replace(string(exp), "dns_suffix: tunx.internal", "dns_suffix: other.internal", 1)
+	json.Unmarshal(c.want(200, "POST", "/api/import?dry_run=1", changed), &res)
+	if len(res.Changes) != 1 || res.Changes[0].Kind != "network" {
+		t.Fatalf("preview changes %v", res.Changes)
+	}
+	if got := c.want(200, "GET", "/api/export", nil); !bytes.Equal(got, exp) {
+		t.Fatal("dry-run import changed the network")
+	}
 	json.Unmarshal(c.want(200, "POST", "/api/import", changed), &res)
 	if len(res.Changes) != 1 || res.Changes[0].Kind != "network" {
 		t.Fatalf("changes %v", res.Changes)

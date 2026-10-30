@@ -184,7 +184,7 @@ accept a session cookie (state-changing requests also need the header
 | `GET /api/{kind}` | admin | list; kinds: `nodes`, `links`, `routes`, `access`, `egress`, `clients`, `groups` |
 | `POST /api/{kind}` | admin | create (409 if the name exists) |
 | `GET`/`PUT`/`DELETE /api/{kind}/{name}` | admin | read, replace, delete |
-| `GET /api/export`, `POST /api/import` | admin | whole network as YAML; import replaces it, idempotent, all or nothing |
+| `GET /api/export`, `POST /api/import` | admin | whole network as YAML; import replaces it, idempotent, all or nothing; `?dry_run=1` validates and returns changes without writing |
 | `GET /api/audit?limit=N` | admin | audit log, newest first |
 | `GET`/`POST /api/tokens`, `DELETE /api/tokens/{name}` | admin | API tokens (`{"name"}` → token, shown once) |
 | `POST /api/nodes/{name}/enroll-token` | admin | one-time enrolment token |

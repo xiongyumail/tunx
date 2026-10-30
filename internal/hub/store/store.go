@@ -282,6 +282,42 @@ func (s *Store) Import(ctx context.Context, actor string, spec *model.Spec) ([]C
 	})
 }
 
+var errPreviewRollback = errors.New("store: rollback preview")
+
+// PreviewImport validates an import and returns the exact changes Import
+// would make. Its database writes and audit entries are rolled back.
+func (s *Store) PreviewImport(ctx context.Context, spec *model.Spec) ([]Change, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var changes []Change
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		old, err := loadSpec(ctx, tx)
+		if err != nil {
+			return err
+		}
+		next := spec.Clone()
+		next.Canonicalize()
+		next.KeepGenerated(old)
+		// Temporary secrets only make the candidate valid; do not consume the
+		// store's configured random stream before the real import.
+		if err := next.FillGenerated(nil); err != nil {
+			return err
+		}
+		if err := next.Validate(); err != nil {
+			return &ValidationError{err}
+		}
+		changes, err = s.write(ctx, tx, "preview", old, next)
+		if err != nil {
+			return err
+		}
+		return errPreviewRollback
+	})
+	if !errors.Is(err, errPreviewRollback) {
+		return nil, err
+	}
+	return changes, nil
+}
+
 func (s *Store) write(ctx context.Context, tx *sql.Tx, actor string, old, next *model.Spec) ([]Change, error) {
 	var changes []Change
 	now := s.stamp()
